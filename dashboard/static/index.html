@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>多路负载监控</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="title-row">
+        <h1>多路负载监控</h1>
+        <span id="connection-pill" class="status-pill" data-state="connecting">正在连接</span>
+      </div>
+      <div class="top-actions">
+        <span id="updated-at" class="updated-at">等待首个样本</span>
+        <button id="pause-button" type="button">暂停</button>
+      </div>
+    </header>
+
+    <section class="metric-grid" aria-label="总览">
+      <article class="metric primary">
+        <span class="metric-label">总下载</span>
+        <strong id="total-download">0 B/s</strong>
+        <span id="active-paths" class="metric-note">0 条线路在线</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">总上传</span>
+        <strong id="total-upload">0 B/s</strong>
+        <span class="metric-note">物理 WAN 实时流量</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">CPU</span>
+        <strong id="cpu-usage">0%</strong>
+        <span id="load-average" class="metric-note">负载 0.00</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">连接跟踪</span>
+        <strong id="conntrack-count">0</strong>
+        <span id="conntrack-note" class="metric-note">占用 0%</span>
+      </article>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="section-heading">
+        <h2>实时下载</h2>
+        <div id="chart-legend" class="legend" aria-label="图例"></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="traffic-chart" role="img" aria-label="最近六分钟各线路下载速度折线图"></canvas>
+        <div id="chart-empty" class="chart-empty">正在收集数据</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <h2>线路负载</h2>
+        <span id="polling-note" class="section-meta">每 2 秒刷新</span>
+      </div>
+      <div id="path-list" class="path-list" aria-live="polite"></div>
+    </section>
+
+    <section class="system-row" aria-label="路由器状态">
+      <div><span>内存</span><strong id="memory-usage">0%</strong></div>
+      <div><span>运行时间</span><strong id="uptime">—</strong></div>
+      <div><span>采集方式</span><strong>单 SSH 连接</strong></div>
+      <div><span>目标</span><strong id="router-target">—</strong></div>
+    </section>
+
+    <div id="error-box" class="error-box" hidden></div>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

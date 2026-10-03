@@ -161,6 +161,30 @@ hitwh-mwan speed
 hitwh-mwan speed 30
 ```
 
+## 本地可视化监控
+
+仓库中的 `dashboard` 是一个不依赖第三方 Python 包的本地网页仪表盘。它通过一条持久 SSH 连接，每 2 秒读取一次路由器已有的状态文件、网卡字节计数和系统负载；浏览器关闭、切到后台或点击暂停后会停止采样。路由器不运行 Web 服务，也不会执行测速。
+
+macOS 或 Linux：
+
+```sh
+./dashboard/start.command
+```
+
+Windows PowerShell：
+
+```powershell
+.\dashboard\start.ps1
+```
+
+也可以直接运行：
+
+```sh
+python3 dashboard/server.py --router root@192.168.100.1
+```
+
+仪表盘默认只监听本机 `127.0.0.1:8765`，并自动打开浏览器。它使用现有 SSH 密钥或 SSH Agent，不保存路由器密码。页面显示总下载/上传、每条线路的实时速度和占比、在线状态、CPU、内存及连接跟踪使用量。
+
 ## 性能边界
 
 - 每条线路约 5 MB/s 时，三路理论持续总量约 15 MB/s。
