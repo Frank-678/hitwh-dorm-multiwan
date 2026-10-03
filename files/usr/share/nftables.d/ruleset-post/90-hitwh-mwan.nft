@@ -1,0 +1,7 @@
+# Managed by hitwh-mwan. The updater atomically fills this chain.
+destroy table inet hitwh_mwan
+table inet hitwh_mwan {
+	chain prerouting {
+		type filter hook prerouting priority mangle - 5; policy accept;
+	}
+}

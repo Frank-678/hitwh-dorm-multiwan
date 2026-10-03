@@ -1,0 +1,305 @@
+#!/bin/sh
+
+MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
+PARENT_DEVICE="$(uci -q get hitwh_mwan.main.parent_device)"
+MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
+LOCK=/var/run/hitwh-mwan-update.lock
+
+[ -n "$MAX_PATHS" ] || MAX_PATHS=16
+[ -n "$PARENT_DEVICE" ] || PARENT_DEVICE=eth1
+[ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
+
+usage() {
+	cat <<'EOF'
+HITwh dorm multi-WAN manager
+
+Usage:
+  hitwh-mwan set-main AA:BB:CC:DD:EE:FF
+  hitwh-mwan add AA:BB:CC:DD:EE:FF
+  hitwh-mwan remove <number|wanN|MAC>
+  hitwh-mwan list
+  hitwh-mwan refresh
+  hitwh-mwan speed [seconds]
+EOF
+}
+
+wan_zone() {
+	for Z in $(uci show firewall | sed -n "s/^\(firewall\.[^.]*\)=zone$/\1/p"); do
+		[ "$(uci -q get "$Z.name")" = wan ] && {
+			echo "$Z"
+			return 0
+		}
+	done
+	return 1
+}
+
+wait_for_updater() {
+	WAIT_LOCK=0
+	while [ -d "$LOCK" ] && [ "$WAIT_LOCK" -lt 15 ]; do
+		sleep 1
+		WAIT_LOCK=$((WAIT_LOCK + 1))
+	done
+}
+
+run_update() {
+	wait_for_updater
+	/usr/sbin/hitwh-mwan-update
+}
+
+normalize_mac() {
+	echo "$1" | tr 'A-F' 'a-f'
+}
+
+valid_mac() {
+	MAC="$1"
+	echo "$MAC" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || return 1
+	FIRST="${MAC%%:*}"
+	[ $((0x$FIRST & 1)) -eq 0 ]
+}
+
+backup_network() {
+	BACKUP_DIR=/root/hitwh-mwan-backups
+	mkdir -p "$BACKUP_DIR"
+	chmod 700 "$BACKUP_DIR"
+	cp /etc/config/network "$BACKUP_DIR/network-$(date +%Y%m%d-%H%M%S)"
+}
+
+find_by_mac() {
+	WANT="$(normalize_mac "$1")"
+	N=2
+	while [ "$N" -le "$MAX_PATHS" ]; do
+		HAVE="$(normalize_mac "$(uci -q get "network.wan${N}dev.macaddr")")"
+		[ -n "$HAVE" ] && [ "$HAVE" = "$WANT" ] && {
+			echo "$N"
+			return 0
+		}
+		N=$((N + 1))
+	done
+	return 1
+}
+
+wait_for_ip() {
+	IFACE="$1"
+	WAIT=0
+	IP=""
+	while [ "$WAIT" -lt 30 ]; do
+		IP="$(ubus call "network.interface.$IFACE" status 2>/dev/null |
+			jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+		[ -n "$IP" ] && break
+		sleep 1
+		WAIT=$((WAIT + 1))
+	done
+	echo "$IP"
+}
+
+cmd_set_main() {
+	MAC="$(normalize_mac "$1")"
+	valid_mac "$MAC" || {
+		echo "Error: invalid or multicast MAC address."
+		exit 2
+	}
+
+	wait_for_updater
+	backup_network
+	ifdown "$MAIN_INTERFACE" || true
+	uci set "network.$MAIN_INTERFACE.macaddr=$MAC"
+	uci commit network
+	/etc/init.d/network reload
+	ifup "$MAIN_INTERFACE"
+	IP="$(wait_for_ip "$MAIN_INTERFACE")"
+	run_update
+
+	if [ -n "$IP" ]; then
+		echo "Main WAN updated: MAC=$MAC IP=$IP"
+	else
+		echo "Main WAN MAC updated, but DHCP has not returned an address yet."
+	fi
+}
+
+cmd_add() {
+	MAC="$(normalize_mac "$1")"
+	valid_mac "$MAC" || {
+		echo "Error: invalid or multicast MAC address."
+		exit 2
+	}
+
+	MAIN_MAC="$(normalize_mac "$(uci -q get "network.$MAIN_INTERFACE.macaddr")")"
+	[ -n "$MAIN_MAC" ] || MAIN_MAC="$(normalize_mac "$(cat "/sys/class/net/$PARENT_DEVICE/address" 2>/dev/null)")"
+	[ "$MAC" = "$MAIN_MAC" ] && {
+		echo "Error: this MAC is already used by the main WAN."
+		exit 3
+	}
+
+	EXISTING="$(find_by_mac "$MAC" || true)"
+	[ -z "$EXISTING" ] || {
+		echo "This MAC is already configured as wan$EXISTING."
+		exit 0
+	}
+
+	SLOT=""
+	N=2
+	while [ "$N" -le "$MAX_PATHS" ]; do
+		if ! uci -q get "network.wan$N" >/dev/null; then
+			SLOT="$N"
+			break
+		fi
+		N=$((N + 1))
+	done
+	[ -n "$SLOT" ] || {
+		echo "Error: the configured maximum of $MAX_PATHS paths has been reached."
+		exit 4
+	}
+
+	IFACE="wan$SLOT"
+	DEV="macwan$SLOT"
+	DSEC="wan${SLOT}dev"
+	ZONE="$(wan_zone)" || {
+		echo "Error: OpenWrt WAN firewall zone was not found."
+		exit 5
+	}
+
+	wait_for_updater
+	backup_network
+	uci -q delete "network.$DSEC"
+	uci set "network.$DSEC=device"
+	uci set "network.$DSEC.name=$DEV"
+	uci set "network.$DSEC.type=macvlan"
+	uci set "network.$DSEC.ifname=$PARENT_DEVICE"
+	uci set "network.$DSEC.mode=bridge"
+	uci set "network.$DSEC.macaddr=$MAC"
+
+	uci -q delete "network.$IFACE"
+	uci set "network.$IFACE=interface"
+	uci set "network.$IFACE.device=$DEV"
+	uci set "network.$IFACE.proto=dhcp"
+	uci set "network.$IFACE.metric=$((SLOT * 10))"
+	uci set "network.$IFACE.defaultroute=0"
+	uci set "network.$IFACE.peerdns=0"
+	uci set "network.$IFACE.delegate=0"
+
+	uci -q del_list "$ZONE.network=$IFACE" || true
+	uci add_list "$ZONE.network=$IFACE"
+	uci commit network
+	uci commit firewall
+
+	/etc/init.d/network reload
+	ifup "$IFACE"
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	IP="$(wait_for_ip "$IFACE")"
+	run_update
+
+	if [ -n "$IP" ]; then
+		STATE="$(grep "^$IFACE " /tmp/hitwh-mwan.status | sed -n 's/.* state=\([^ ]*\).*/\1/p')"
+		echo "Added $IFACE: MAC=$MAC IP=$IP state=${STATE:-unknown}"
+	else
+		echo "Created $IFACE, but DHCP has not returned an address. The monitor will retry."
+	fi
+}
+
+resolve_slot() {
+	ARG="$1"
+	case "$ARG" in
+		wan[0-9]*) echo "${ARG#wan}"; return 0 ;;
+		*[!0-9]*|'')
+			case "$ARG" in
+				*:*) find_by_mac "$ARG"; return $? ;;
+			esac
+			;;
+		*) echo "$ARG"; return 0 ;;
+	esac
+	return 1
+}
+
+cmd_remove() {
+	SLOT="$(resolve_slot "$1" || true)"
+	case "$SLOT" in
+		''|1|*[!0-9]*)
+			echo "Error: only wan2 through wan$MAX_PATHS can be removed."
+			exit 2
+			;;
+	esac
+	[ "$SLOT" -le "$MAX_PATHS" ] || {
+		echo "Error: path number is out of range."
+		exit 2
+	}
+
+	IFACE="wan$SLOT"
+	DSEC="wan${SLOT}dev"
+	uci -q get "network.$IFACE" >/dev/null || {
+		echo "$IFACE does not exist."
+		exit 3
+	}
+	ZONE="$(wan_zone)" || exit 5
+
+	wait_for_updater
+	backup_network
+	ifdown "$IFACE" || true
+	uci -q delete "network.$IFACE"
+	uci -q delete "network.$DSEC"
+	uci -q del_list "$ZONE.network=$IFACE" || true
+	uci commit network
+	uci commit firewall
+	/etc/init.d/network reload
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	run_update
+	echo "Removed $IFACE. Existing connections on that path were closed."
+}
+
+cmd_list() {
+	run_update
+	cat /tmp/hitwh-mwan.status
+
+	N=2
+	while [ "$N" -le "$MAX_PATHS" ]; do
+		if uci -q get "network.wan$N" >/dev/null && ! grep -q "^wan$N " /tmp/hitwh-mwan.status; then
+			MAC="$(uci -q get "network.wan${N}dev.macaddr")"
+			echo "wan$N mac=$MAC ip=none state=no-dhcp"
+		fi
+		N=$((N + 1))
+	done
+}
+
+cmd_speed() {
+	SECONDS_TO_RUN="${1:-0}"
+	case "$SECONDS_TO_RUN" in *[!0-9]*) echo "Error: seconds must be an integer."; exit 2 ;; esac
+	COUNTER="/sys/class/net/$PARENT_DEVICE/statistics/rx_bytes"
+	[ -r "$COUNTER" ] || {
+		echo "Error: cannot read RX counter for $PARENT_DEVICE."
+		exit 3
+	}
+
+	LAST="$(cat "$COUNTER")"
+	ELAPSED=0
+	while [ "$SECONDS_TO_RUN" -eq 0 ] || [ "$ELAPSED" -lt "$SECONDS_TO_RUN" ]; do
+		sleep 1
+		NOW="$(cat "$COUNTER")"
+		awk -v bytes="$((NOW - LAST))" 'BEGIN { printf "%.2f MB/s\n", bytes / 1048576 }'
+		LAST="$NOW"
+		ELAPSED=$((ELAPSED + 1))
+	done
+}
+
+case "$1" in
+	set-main)
+		[ -n "$2" ] || { usage; exit 1; }
+		cmd_set_main "$2"
+		;;
+	add)
+		[ -n "$2" ] || { usage; exit 1; }
+		cmd_add "$2"
+		;;
+	remove)
+		[ -n "$2" ] || { usage; exit 1; }
+		cmd_remove "$2"
+		;;
+	list|refresh)
+		cmd_list
+		;;
+	speed)
+		cmd_speed "$2"
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

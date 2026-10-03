@@ -1,0 +1,148 @@
+#!/bin/sh
+
+LOCK=/var/run/hitwh-mwan-update.lock
+CHECKDIR="/tmp/hitwh-mwan-check.$$"
+PATHFILE="/tmp/hitwh-mwan-paths.$$"
+RULES="/tmp/hitwh-mwan-rules.$$"
+
+MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
+LAN_DEVICE="$(uci -q get hitwh_mwan.main.lan_device)"
+MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
+HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
+HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
+FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
+
+[ -n "$MAX_PATHS" ] || MAX_PATHS=16
+[ -n "$LAN_DEVICE" ] || LAN_DEVICE=br-lan
+[ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
+[ -n "$HEALTH_URL" ] || HEALTH_URL=https://cp.cloudflare.com/generate_204
+[ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
+
+mkdir "$LOCK" 2>/dev/null || exit 0
+mkdir -p "$CHECKDIR"
+: >"$PATHFILE"
+trap 'rm -rf "$LOCK" "$CHECKDIR" "$PATHFILE" "$RULES"' EXIT INT TERM
+
+iface_status() {
+	ubus call "network.interface.$1" status 2>/dev/null
+}
+
+get_ip() {
+	iface_status "$1" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null
+}
+
+get_dev() {
+	iface_status "$1" | jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+DYNAMIC_GATEWAY="$(iface_status "$MAIN_INTERFACE" | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)"
+GATEWAY="${DYNAMIC_GATEWAY:-$FALLBACK_GATEWAY}"
+[ -n "$GATEWAY" ] || exit 1
+
+# Remove rules and route tables that this project owns before rebuilding them.
+N=1
+while [ "$N" -le "$MAX_PATHS" ]; do
+	TABLE=$((100 + N))
+	while ip rule del priority "$((1000 + TABLE))" 2>/dev/null; do :; done
+	while ip rule del priority "$((1100 + TABLE))" 2>/dev/null; do :; done
+	ip route flush table "$TABLE" 2>/dev/null || true
+	N=$((N + 1))
+done
+
+setup_path() {
+	N="$1"
+	IFACE="$2"
+	DEV="$(get_dev "$IFACE")"
+	IP="$(get_ip "$IFACE")"
+	[ -n "$DEV" ] && [ -n "$IP" ] || return 1
+
+	TABLE=$((100 + N))
+	MARK="$(printf '0x%x' "$((0x100 + N))")"
+	MAC="$(cat "/sys/class/net/$DEV/address" 2>/dev/null)"
+
+	# A host route makes the gateway reachable inside each independent table.
+	ip route replace table "$TABLE" "$GATEWAY/32" dev "$DEV" src "$IP" || return 1
+	ip route replace table "$TABLE" default via "$GATEWAY" dev "$DEV" src "$IP" || return 1
+	ip rule add priority "$((1000 + TABLE))" fwmark "$MARK/0xfff" lookup "$TABLE"
+	ip rule add priority "$((1100 + TABLE))" from "$IP/32" lookup "$TABLE"
+	echo "$N|$IFACE|$DEV|$IP|$TABLE|$MARK|$MAC" >>"$PATHFILE"
+}
+
+setup_path 1 "$MAIN_INTERFACE" || true
+N=2
+while [ "$N" -le "$MAX_PATHS" ]; do
+	uci -q get "network.wan$N" >/dev/null && setup_path "$N" "wan$N" || true
+	N=$((N + 1))
+done
+
+# Check every path in parallel. A captive-portal response is not considered online.
+while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+	(
+		CODE="$(curl -sS --interface "$IP" --connect-timeout 4 --max-time 7 \
+			-o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null)"
+		[ "$CODE" = "$HEALTH_CODE" ] && : >"$CHECKDIR/$N.ok"
+	) &
+done <"$PATHFILE"
+wait
+
+ACTIVE_MARKS=""
+ACTIVE_NAMES=""
+COUNT=0
+while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+	if [ -f "$CHECKDIR/$N.ok" ]; then
+		ACTIVE_MARKS="$ACTIVE_MARKS $MARK"
+		ACTIVE_NAMES="$ACTIVE_NAMES $IFACE"
+		COUNT=$((COUNT + 1))
+	fi
+done <"$PATHFILE"
+
+# If the public health endpoint itself is unavailable, retain the first path.
+if [ "$COUNT" -eq 0 ]; then
+	FIRST="$(head -n 1 "$PATHFILE")"
+	[ -n "$FIRST" ] || exit 1
+	MARK="$(echo "$FIRST" | cut -d'|' -f6)"
+	IFACE="$(echo "$FIRST" | cut -d'|' -f2)"
+	ACTIVE_MARKS=" $MARK"
+	ACTIVE_NAMES=" $IFACE"
+	COUNT=1
+fi
+
+if ! nft list table inet hitwh_mwan >/dev/null 2>&1; then
+	nft -f /usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft
+fi
+
+set -- $ACTIVE_MARKS
+{
+	echo 'flush chain inet hitwh_mwan prerouting'
+	echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state established,related meta mark set ct mark"
+	if [ "$COUNT" -eq 1 ]; then
+		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto { tcp, udp } ct mark set $1"
+	else
+		MAP=""
+		IDX=0
+		for MARK in "$@"; do
+			[ -z "$MAP" ] || MAP="$MAP, "
+			MAP="$MAP$IDX : $MARK"
+			IDX=$((IDX + 1))
+		done
+		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto { tcp, udp } ct mark set numgen random mod $COUNT map { $MAP }"
+	fi
+	echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" meta mark set ct mark"
+	while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" meta mark $MARK counter"
+	done <"$PATHFILE"
+} >"$RULES"
+nft -f "$RULES"
+
+{
+	date
+	echo "active_count:$COUNT"
+	echo "active_interfaces:$ACTIVE_NAMES"
+	while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+		STATE=inactive
+		[ -f "$CHECKDIR/$N.ok" ] && STATE=active
+		echo "$IFACE mac=$MAC ip=$IP state=$STATE mark=$MARK"
+	done <"$PATHFILE"
+} >/tmp/hitwh-mwan.status
+
+logger -t hitwh-mwan "active interfaces:$ACTIVE_NAMES"

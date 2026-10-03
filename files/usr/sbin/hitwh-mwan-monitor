@@ -1,0 +1,11 @@
+#!/bin/sh
+
+LOCK=/var/run/hitwh-mwan-update.lock
+INTERVAL="$(uci -q get hitwh_mwan.main.health_interval)"
+[ -n "$INTERVAL" ] || INTERVAL=30
+
+rm -rf "$LOCK"
+while :; do
+	/usr/sbin/hitwh-mwan-update
+	sleep "$INTERVAL"
+done
