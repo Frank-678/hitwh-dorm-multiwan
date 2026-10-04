@@ -1,3 +1,3 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-python server.py @args
+python -X utf8 server.py @args

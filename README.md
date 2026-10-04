@@ -167,7 +167,7 @@ hitwh-mwan speed 30
 
 运行前需要安装 Python 3.10 或更高版本，并确保 `ssh` 可用；macOS/Linux 的启动脚本使用 `python3`，Windows 的启动脚本使用 `python`。先运行 `ssh root@192.168.100.1` 确认密钥登录正常。OpenWrt 的 Dropbear 使用 `/etc/dropbear/authorized_keys` 保存 root 的授权公钥。
 
-SSH 采样脚本统一使用 UTF-8 与 LF 换行发送，避免 Windows 的 CRLF 导致远端 `sh` 报语法错误。仓库通过 `.gitattributes` 保持文本文件的 LF 换行；GitHub Actions 在 Linux、macOS、Windows 上运行回归测试并检查各自的启动脚本。
+启动脚本启用 Python 的 UTF-8 模式，确保中文提示在英文系统和重定向输出时也能正常显示。SSH 采样脚本统一使用 UTF-8 与 LF 换行发送，避免 Windows 的 CRLF 导致远端 `sh` 报语法错误。仓库通过 `.gitattributes` 保持文本文件的 LF 换行；GitHub Actions 在 Linux、macOS、Windows 上运行回归测试并检查各自的启动脚本。
 
 macOS 或 Linux：
 
@@ -184,7 +184,7 @@ Windows PowerShell：
 也可以直接运行：
 
 ```sh
-python3 dashboard/server.py --router root@192.168.100.1
+python3 -X utf8 dashboard/server.py --router root@192.168.100.1
 ```
 
 仪表盘默认只监听本机 `127.0.0.1:8765`，并自动打开浏览器。它使用现有 SSH 密钥或 SSH Agent，不保存路由器密码。页面显示总下载/上传、每条线路的实时速度和占比、在线状态、CPU、内存及连接跟踪使用量。

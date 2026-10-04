@@ -1,5 +1,7 @@
 import importlib.util
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -41,6 +43,20 @@ DEV\twan2\tmacwan2\t450000\t140000
 
 
 class DashboardTests(unittest.TestCase):
+    def test_launcher_prints_utf8_help_with_legacy_locale(self):
+        if os.name == "nt":
+            command = [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(MODULE_PATH.parent / "start.ps1"), "--help",
+            ]
+        else:
+            command = ["sh", str(MODULE_PATH.parent / "start.command"), "--help"]
+        env = dict(os.environ, PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", LC_ALL="C")
+        env.pop("PYTHONIOENCODING", None)
+        result = subprocess.run(command, env=env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn(SERVER.build_parser().description, result.stdout.decode("utf-8"))
+
     def test_collector_sends_lf_script_and_reads_text_frames(self):
         collector = SERVER.RouterCollector("unused", 2.0)
         frame = "\n".join([*FRAME_ONE, "@@END", ""])
