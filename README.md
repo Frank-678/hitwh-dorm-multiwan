@@ -147,8 +147,10 @@ hitwh-mwan add AA:BB:CC:DD:EE:FF
 脚本会自动选择下一个 `wanN`，创建 macvlan、申请 DHCP、加入防火墙和均衡池。默认最多支持 16 条线路，包括主 WAN。
 
 ```sh
-# 查看并重新检查全部线路
+# 查看并重新检查全部线路，不重启接口
 hitwh-mwan list
+
+# 检查并重连离线线路；在线线路不会中断
 hitwh-mwan refresh
 
 # 删除一条线路，三种写法均可

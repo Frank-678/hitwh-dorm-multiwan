@@ -68,12 +68,24 @@ h2 {
 }
 
 .top-actions { gap: 12px; }
+.action-statuses { min-width: 0; text-align: right; }
 
 .updated-at,
 .section-meta {
   color: var(--muted);
   font-size: 13px;
 }
+
+.refresh-status {
+  display: block;
+  min-height: 16px;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.refresh-status[data-state="success"] { color: var(--green); }
+.refresh-status[data-state="error"] { color: var(--red); }
 
 button {
   min-height: 36px;
@@ -88,6 +100,7 @@ button {
 
 button:hover { background: #f8fafc; }
 button:focus-visible { outline: 3px solid rgb(37 99 235 / 0.22); outline-offset: 2px; }
+button:disabled { cursor: wait; opacity: 0.62; }
 
 .status-pill {
   display: inline-flex;
@@ -264,7 +277,8 @@ button:focus-visible { outline: 3px solid rgb(37 99 235 / 0.22); outline-offset:
 @media (max-width: 620px) {
   .shell { width: min(100% - 24px, 1180px); padding-top: 20px; }
   .topbar { align-items: flex-start; }
-  .top-actions { align-items: flex-end; flex-direction: column-reverse; }
+  .top-actions { align-items: flex-end; flex-wrap: wrap; justify-content: flex-end; }
+  .action-statuses { flex-basis: 100%; order: 3; }
   .updated-at { max-width: 140px; text-align: right; }
   .metric-grid { grid-template-columns: 1fr; }
   .metric { min-height: 112px; }

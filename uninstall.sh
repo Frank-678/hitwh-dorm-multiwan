@@ -11,7 +11,7 @@ MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths || true)"
 PARENT_DEVICE="$(uci -q get hitwh_mwan.main.parent_device || true)"
 PREV_FLOW="$(uci -q get hitwh_mwan.main.previous_flow_offloading || true)"
 PREV_FLOW_HW="$(uci -q get hitwh_mwan.main.previous_flow_offloading_hw || true)"
-[ -n "$MAX_PATHS" ] || MAX_PATHS=16
+[ -n "$MAX_PATHS" ] || MAX_PATHS=17
 [ -n "$PARENT_DEVICE" ] || PARENT_DEVICE=eth1
 
 BACKUP_DIR="/root/hitwh-mwan-backups/uninstall-$(date +%Y%m%d-%H%M%S)"

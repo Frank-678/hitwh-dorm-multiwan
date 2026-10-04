@@ -229,6 +229,34 @@ function pauseSampling() {
   fetch("/api/pause", { method: "POST", keepalive: true }).catch(() => {});
 }
 
+async function reconnectPaths() {
+  const button = $("#reconnect-button");
+  const status = $("#refresh-status");
+  button.disabled = true;
+  button.textContent = "重连中…";
+  status.dataset.state = "";
+  status.textContent = "正在检查并重连离线线路";
+  try {
+    const response = await fetch("/api/reconnect", {
+      method: "POST",
+      headers: { "X-Dashboard-Action": "reconnect-paths" },
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.message || `HTTP ${response.status}`);
+    status.dataset.state = "success";
+    status.textContent = result.message;
+    if (!state.paused) await poll();
+  } catch (error) {
+    status.dataset.state = "error";
+    status.textContent = `重连失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "重连离线线路";
+  }
+}
+
+$("#reconnect-button").addEventListener("click", reconnectPaths);
+
 $("#pause-button").addEventListener("click", () => {
   state.paused = !state.paused;
   $("#pause-button").textContent = state.paused ? "继续" : "暂停";

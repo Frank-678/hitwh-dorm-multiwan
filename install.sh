@@ -5,6 +5,13 @@ set -eu
 PROJECT_RAW="${HITWH_MWAN_REPO_RAW:-https://raw.githubusercontent.com/ponder-j/hitwh-dorm-multiwan/main}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
 BACKUP_DIR="/root/hitwh-mwan-backups/install-$(date +%Y%m%d-%H%M%S)"
+LEGACY_FILES='/usr/sbin/campus-wan
+/usr/sbin/campus-mwan-update
+/usr/sbin/campus-mwan-monitor
+/etc/init.d/campus-mwan
+/etc/hotplug.d/iface/95-campus-mwan
+/usr/share/nftables.d/ruleset-post/90-campus-mwan.nft
+/etc/config/campus_mwan'
 
 FILES='files/usr/sbin/hitwh-mwan
 files/usr/sbin/hitwh-mwan-update
@@ -35,6 +42,17 @@ chmod 700 /root/hitwh-mwan-backups "$BACKUP_DIR"
 cp /etc/config/network "$BACKUP_DIR/network"
 cp /etc/config/firewall "$BACKUP_DIR/firewall"
 [ ! -f /etc/config/hitwh_mwan ] || cp /etc/config/hitwh_mwan "$BACKUP_DIR/hitwh_mwan"
+echo "$LEGACY_FILES" | while IFS= read -r LEGACY; do
+	[ -f "$LEGACY" ] || continue
+	DEST="$BACKUP_DIR/legacy$LEGACY"
+	mkdir -p "$(dirname "$DEST")"
+	cp "$LEGACY" "$DEST"
+done
+
+# Migrate an older campus_mwan UCI package before installing the unified names.
+if [ ! -f /etc/config/hitwh_mwan ] && [ -f /etc/config/campus_mwan ]; then
+	cp /etc/config/campus_mwan /etc/config/hitwh_mwan
+fi
 
 download() {
 	REL="$1"
@@ -52,6 +70,8 @@ download() {
 }
 
 /etc/init.d/hitwh-mwan stop >/dev/null 2>&1 || true
+/etc/init.d/campus-mwan stop >/dev/null 2>&1 || true
+/etc/init.d/campus-mwan disable >/dev/null 2>&1 || true
 
 echo "$FILES" | while IFS= read -r REL; do
 	[ -n "$REL" ] || continue
@@ -92,11 +112,24 @@ for PATH_TO_KEEP in \
 done
 
 fw4 check
+# Remove legacy hooks before reloading firewall4 so only one marking table runs.
+rm -f /etc/hotplug.d/iface/95-campus-mwan \
+	/usr/share/nftables.d/ruleset-post/90-campus-mwan.nft
 /etc/init.d/firewall reload >/dev/null 2>&1 || true
 /etc/init.d/hitwh-mwan enable
 /etc/init.d/hitwh-mwan start
 sleep 2
-/usr/sbin/hitwh-mwan-update || true
+/usr/sbin/hitwh-mwan-update || die "the unified hitwh-mwan updater failed"
+
+nft delete table inet campus_mwan >/dev/null 2>&1 || true
+rm -f /usr/sbin/campus-wan \
+	/usr/sbin/campus-mwan-update \
+	/usr/sbin/campus-mwan-monitor \
+	/etc/init.d/campus-mwan \
+	/etc/config/campus_mwan
+for LEGACY in $LEGACY_FILES; do
+	sed -i "\|^$LEGACY\$|d" /etc/sysupgrade.conf
+done
 
 cat <<EOF
 Installed HITwh dorm multi-WAN.

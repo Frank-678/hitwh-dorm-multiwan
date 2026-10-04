@@ -4,8 +4,10 @@ MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
 PARENT_DEVICE="$(uci -q get hitwh_mwan.main.parent_device)"
 MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
 LOCK=/var/run/hitwh-mwan-update.lock
+UPDATE_COMMAND="${HITWH_MWAN_UPDATE:-/usr/sbin/hitwh-mwan-update}"
+STATUS_FILE="${HITWH_MWAN_STATUS:-/tmp/hitwh-mwan.status}"
 
-[ -n "$MAX_PATHS" ] || MAX_PATHS=16
+[ -n "$MAX_PATHS" ] || MAX_PATHS=17
 [ -n "$PARENT_DEVICE" ] || PARENT_DEVICE=eth1
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
 
@@ -43,7 +45,7 @@ wait_for_updater() {
 
 run_update() {
 	wait_for_updater
-	/usr/sbin/hitwh-mwan-update
+	"$UPDATE_COMMAND"
 }
 
 normalize_mac() {
@@ -68,6 +70,7 @@ find_by_mac() {
 	WANT="$(normalize_mac "$1")"
 	N=2
 	while [ "$N" -le "$MAX_PATHS" ]; do
+		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
 		HAVE="$(normalize_mac "$(uci -q get "network.wan${N}dev.macaddr")")"
 		[ -n "$HAVE" ] && [ "$HAVE" = "$WANT" ] && {
 			echo "$N"
@@ -76,6 +79,23 @@ find_by_mac() {
 		N=$((N + 1))
 	done
 	return 1
+}
+
+is_managed_path() {
+	SLOT="$1"
+	IFACE="wan$SLOT"
+	DSEC="wan${SLOT}dev"
+	EXPECTED_DEV="macwan$SLOT"
+
+	TYPE="$(uci -q get "network.$DSEC.type" || true)"
+	PARENT="$(uci -q get "network.$DSEC.ifname" || true)"
+	DEVICE="$(uci -q get "network.$IFACE.device" || true)"
+	PROTO="$(uci -q get "network.$IFACE.proto" || true)"
+
+	[ "$TYPE" = macvlan ] &&
+		[ "$PARENT" = "$PARENT_DEVICE" ] &&
+		[ "$DEVICE" = "$EXPECTED_DEV" ] &&
+		[ "$PROTO" = dhcp ]
 }
 
 wait_for_ip() {
@@ -139,6 +159,7 @@ cmd_add() {
 	SLOT=""
 	N=2
 	while [ "$N" -le "$MAX_PATHS" ]; do
+		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
 		if ! uci -q get "network.wan$N" >/dev/null; then
 			SLOT="$N"
 			break
@@ -229,6 +250,10 @@ cmd_remove() {
 		echo "$IFACE does not exist."
 		exit 3
 	}
+	is_managed_path "$SLOT" || {
+		echo "Refusing to remove $IFACE: it was not created by HITwh dorm multi-WAN."
+		exit 4
+	}
 	ZONE="$(wan_zone)" || exit 5
 
 	wait_for_updater
@@ -247,16 +272,74 @@ cmd_remove() {
 
 cmd_list() {
 	run_update
-	cat /tmp/hitwh-mwan.status
+	print_status
+}
+
+print_status() {
+	cat "$STATUS_FILE"
 
 	N=2
 	while [ "$N" -le "$MAX_PATHS" ]; do
-		if uci -q get "network.wan$N" >/dev/null && ! grep -q "^wan$N " /tmp/hitwh-mwan.status; then
+		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
+		if is_managed_path "$N" && ! grep -q "^wan$N " "$STATUS_FILE"; then
 			MAC="$(uci -q get "network.wan${N}dev.macaddr")"
 			echo "wan$N mac=$MAC ip=none state=no-dhcp"
 		fi
 		N=$((N + 1))
 	done
+}
+
+managed_paths() {
+	echo "$MAIN_INTERFACE"
+	N=2
+	while [ "$N" -le "$MAX_PATHS" ]; do
+		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
+		is_managed_path "$N" && echo "wan$N"
+		N=$((N + 1))
+	done
+}
+
+cmd_refresh() {
+	run_update
+	OFFLINE=""
+	for IFACE in $(managed_paths); do
+		grep -q "^$IFACE .* state=active" "$STATUS_FILE" || OFFLINE="$OFFLINE $IFACE"
+	done
+
+	set -- $OFFLINE
+	ATTEMPTED=$#
+	if [ "$ATTEMPTED" -eq 0 ]; then
+		print_status
+		echo "RESULT 0 0 0"
+		return 0
+	fi
+
+	for IFACE in "$@"; do ifdown "$IFACE" >/dev/null 2>&1 || true; done
+	sleep 1
+	for IFACE in "$@"; do ifup "$IFACE" >/dev/null 2>&1 || true; done
+
+	WAIT=0
+	while [ "$WAIT" -lt 20 ]; do
+		PENDING=0
+		for IFACE in "$@"; do
+			IP="$(ubus call "network.interface.$IFACE" status 2>/dev/null |
+				jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+			[ -n "$IP" ] || PENDING=$((PENDING + 1))
+		done
+		[ "$PENDING" -eq 0 ] && break
+		sleep 1
+		WAIT=$((WAIT + 1))
+	done
+
+	run_update
+	REMAINING=0
+	for IFACE in "$@"; do
+		grep -q "^$IFACE .* state=active" "$STATUS_FILE" || REMAINING=$((REMAINING + 1))
+	done
+	RECOVERED=$((ATTEMPTED - REMAINING))
+	print_status
+	echo "RESULT $ATTEMPTED $RECOVERED $REMAINING"
+	[ "$REMAINING" -eq 0 ]
 }
 
 cmd_speed() {
@@ -292,8 +375,11 @@ case "$1" in
 		[ -n "$2" ] || { usage; exit 1; }
 		cmd_remove "$2"
 		;;
-	list|refresh)
+	list)
 		cmd_list
+		;;
+	refresh)
+		cmd_refresh
 		;;
 	speed)
 		cmd_speed "$2"

@@ -15,10 +15,11 @@ HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
 HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
 FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
 
-[ -n "$MAX_PATHS" ] || MAX_PATHS=16
+[ -n "$FALLBACK_GATEWAY" ] || FALLBACK_GATEWAY=10.240.255.254
+[ -n "$MAX_PATHS" ] || MAX_PATHS=17
 [ -n "$LAN_DEVICE" ] || LAN_DEVICE=br-lan
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
-[ -n "$HEALTH_URL" ] || HEALTH_URL=https://cp.cloudflare.com/generate_204
+[ -n "$HEALTH_URL" ] || HEALTH_URL=http://connectivitycheck.gstatic.com/generate_204
 [ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
 
 mkdir "$LOCK" 2>/dev/null || exit 0
@@ -100,9 +101,9 @@ setup_path() {
 	MAC="$(cat "/sys/class/net/$DEV/address" 2>/dev/null)"
 
 	ensure_guard "$TABLE" || return 1
-	# A host route makes the gateway reachable inside each independent table.
-	if ! route_matches "$TABLE" "$GATEWAY/32" '' "$DEV" "$IP"; then
-		ip -4 route replace table "$TABLE" "$GATEWAY/32" dev "$DEV" src "$IP" || return 1
+	# The campus subnet route also makes the shared gateway reachable.
+	if ! route_matches "$TABLE" "10.240.0.0/16" '' "$DEV" "$IP"; then
+		ip -4 route replace table "$TABLE" "10.240.0.0/16" dev "$DEV" src "$IP" || return 1
 	fi
 	if ! route_matches "$TABLE" default "$GATEWAY" "$DEV" "$IP"; then
 		ip -4 route replace table "$TABLE" default via "$GATEWAY" dev "$DEV" src "$IP" || return 1
@@ -115,6 +116,7 @@ setup_path() {
 setup_path 1 "$MAIN_INTERFACE" || true
 N=2
 while [ "$N" -le "$MAX_PATHS" ]; do
+	if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
 	uci -q get "network.wan$N" >/dev/null && setup_path "$N" "wan$N" || true
 	N=$((N + 1))
 done
@@ -186,6 +188,7 @@ set -- $ACTIVE_MARKS
 		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" meta mark $MARK counter"
 	done <"$PATHFILE"
 } >"$RULES"
+
 # Compare both the desired batch and the live stateless chain. The live check
 # repairs a firewall reload/manual drift even when our cached batch is intact.
 if ! nft -s list chain inet hitwh_mwan prerouting >"$NFT_CURRENT" 2>/dev/null; then

@@ -16,7 +16,11 @@
         <span id="connection-pill" class="status-pill" data-state="connecting">正在连接</span>
       </div>
       <div class="top-actions">
-        <span id="updated-at" class="updated-at">等待首个样本</span>
+        <div class="action-statuses">
+          <span id="updated-at" class="updated-at">等待首个样本</span>
+          <span id="refresh-status" class="refresh-status" role="status" aria-live="polite"></span>
+        </div>
+        <button id="reconnect-button" type="button">重连离线线路</button>
         <button id="pause-button" type="button">暂停</button>
       </div>
     </header>

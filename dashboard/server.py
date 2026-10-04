@@ -26,6 +26,76 @@ from typing import Any, Iterable
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
+RECONNECT_SCRIPT = r'''#!/bin/sh
+if command -v hitwh-mwan >/dev/null 2>&1; then
+	exec hitwh-mwan refresh
+fi
+
+refresh_status() {
+	if command -v campus-wan >/dev/null 2>&1; then
+		campus-wan refresh
+	elif [ -x /usr/sbin/campus-mwan-update ]; then
+		/usr/sbin/campus-mwan-update
+	else
+		echo "No supported multi-WAN refresh command was found." >&2
+		return 127
+	fi
+}
+
+refresh_status >/dev/null || exit $?
+STATUS=""
+for CANDIDATE in /tmp/hitwh-mwan.status /tmp/campus-mwan.status; do
+	[ -r "$CANDIDATE" ] && { STATUS="$CANDIDATE"; break; }
+done
+[ -n "$STATUS" ] || { echo "Multi-WAN status file is unavailable." >&2; exit 1; }
+
+OFFLINE=""
+for IFACE in wan $(
+	N=2
+	while [ "$N" -le 17 ]; do
+		if [ "$N" -ne 6 ] && uci -q get "network.wan$N" >/dev/null; then
+			echo "wan$N"
+		fi
+		N=$((N + 1))
+	done
+); do
+	grep -q "^$IFACE .* state=active" "$STATUS" || OFFLINE="$OFFLINE $IFACE"
+done
+
+set -- $OFFLINE
+ATTEMPTED=$#
+if [ "$ATTEMPTED" -eq 0 ]; then
+	echo "RESULT 0 0 0"
+	exit 0
+fi
+
+for IFACE in "$@"; do ifdown "$IFACE" >/dev/null 2>&1 || true; done
+sleep 1
+for IFACE in "$@"; do ifup "$IFACE" >/dev/null 2>&1 || true; done
+
+WAIT=0
+while [ "$WAIT" -lt 20 ]; do
+	PENDING=0
+	for IFACE in "$@"; do
+		IP="$(ubus call "network.interface.$IFACE" status 2>/dev/null |
+			jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+		[ -n "$IP" ] || PENDING=$((PENDING + 1))
+	done
+	[ "$PENDING" -eq 0 ] && break
+	sleep 1
+	WAIT=$((WAIT + 1))
+done
+
+refresh_status >/dev/null || exit $?
+REMAINING=0
+for IFACE in "$@"; do
+	grep -q "^$IFACE .* state=active" "$STATUS" || REMAINING=$((REMAINING + 1))
+done
+RECOVERED=$((ATTEMPTED - REMAINING))
+echo "RESULT $ATTEMPTED $RECOVERED $REMAINING"
+[ "$REMAINING" -eq 0 ]
+'''
+
 REMOTE_SCRIPT = r'''#!/bin/sh
 INTERVAL="$1"
 [ -n "$INTERVAL" ] || INTERVAL=2
@@ -48,7 +118,9 @@ while :; do
 	COUNT="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
 	MAX="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
 	printf 'CONN\t%s\t%s\n' "${COUNT:-0}" "${MAX:-0}"
-	awk '{ printf "UPTIME\t%d\n", $1 }' /proc/uptime
+	# Keep the fractional, monotonic uptime for accurate rate calculations.
+	# The wall-clock timestamp above is intentionally only used for labels.
+	awk '{ printf "UPTIME\t%s\n", $1 }' /proc/uptime
 
 	if [ -n "$STATUS" ]; then
 		while IFS= read -r LINE; do
@@ -84,6 +156,7 @@ def parse_frame(lines: Iterable[str]) -> dict[str, Any]:
         "memory": {"total_kib": 0, "available_kib": 0},
         "conntrack": {"count": 0, "max": 0},
         "uptime": 0,
+        "sample_clock": 0.0,
         "paths": {},
         "devices": {},
     }
@@ -108,7 +181,8 @@ def parse_frame(lines: Iterable[str]) -> dict[str, Any]:
             elif kind == "CONN" and len(parts) >= 3:
                 result["conntrack"] = {"count": int(parts[1]), "max": int(parts[2])}
             elif kind == "UPTIME" and len(parts) >= 2:
-                result["uptime"] = int(float(parts[1]))
+                result["sample_clock"] = float(parts[1])
+                result["uptime"] = int(result["sample_clock"])
             elif kind == "PATH" and len(parts) >= 2:
                 fields = parts[1].split()
                 iface = fields[0]
@@ -153,7 +227,12 @@ class RateCalculator:
     def transform(self, raw: dict[str, Any]) -> dict[str, Any]:
         timestamp = int(raw.get("timestamp") or time.time())
         previous = self.previous
-        dt = max(0.25, timestamp - int(previous.get("timestamp", timestamp))) if previous else 0.0
+        sample_clock = float(raw.get("sample_clock") or timestamp)
+        if previous:
+            previous_clock = float(previous.get("sample_clock") or previous.get("timestamp", timestamp))
+            dt = max(0.25, sample_clock - previous_clock)
+        else:
+            dt = 0.0
         previous_devices = previous.get("devices", {}) if previous else {}
 
         deltas: dict[str, dict[str, int]] = {}
@@ -249,6 +328,7 @@ class RouterCollector:
         self.latest: dict[str, Any] | None = None
         self.history: deque[dict[str, Any]] = deque(maxlen=180)
         self.calculator = RateCalculator()
+        self.reconnect_lock = threading.Lock()
 
     def touch(self) -> None:
         with self.lock:
@@ -275,7 +355,7 @@ class RouterCollector:
                 "history": list(self.history),
             }
 
-    def _ssh_command(self) -> list[str]:
+    def _ssh_base_command(self) -> list[str]:
         command = [
             "ssh",
             "-o", "BatchMode=yes",
@@ -286,8 +366,49 @@ class RouterCollector:
         ]
         if self.identity:
             command.extend(["-i", self.identity])
-        command.extend([self.target, f"sh -s -- {self.interval:g}"])
         return command
+
+    def _ssh_command(self) -> list[str]:
+        return [*self._ssh_base_command(), self.target, f"sh -s -- {self.interval:g}"]
+
+    def reconnect_paths(self) -> tuple[bool, str]:
+        if not self.reconnect_lock.acquire(blocking=False):
+            return False, "线路重连正在进行"
+        try:
+            result = subprocess.run(
+                [*self._ssh_base_command(), self.target, "sh -s"],
+                input=RECONNECT_SCRIPT.encode("utf-8"),
+                capture_output=True,
+                timeout=75,
+            )
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            result_line = next(
+                (line for line in stdout.splitlines() if line.startswith("RESULT ")),
+                "",
+            )
+            fields = result_line.split()
+            if len(fields) == 4 and all(value.isdigit() for value in fields[1:]):
+                attempted, recovered, remaining = (int(value) for value in fields[1:])
+                if attempted == 0:
+                    self.touch()
+                    return True, "全部线路在线，无需重连"
+                if remaining == 0 and result.returncode == 0:
+                    self.touch()
+                    return True, f"已恢复 {recovered} 条线路"
+                self.touch()
+                return False, f"已恢复 {recovered}/{attempted} 条；其余线路可能需要重新认证"
+            if result.returncode == 0:
+                self.touch()
+                return True, "线路重连完成"
+            detail = (stderr or stdout).strip()
+            return False, detail or f"远程命令退出状态 {result.returncode}"
+        except subprocess.TimeoutExpired:
+            return False, "线路重连超时"
+        except OSError as exc:
+            return False, str(exc)
+        finally:
+            self.reconnect_lock.release()
 
     def _run(self) -> None:
         while True:
@@ -399,6 +520,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            return
+        if self.path == "/api/reconnect":
+            if self.headers.get("X-Dashboard-Action") != "reconnect-paths":
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            ok, message = self.collector.reconnect_paths()
+            body = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.CONFLICT)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 

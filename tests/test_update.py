@@ -118,12 +118,14 @@ class UpdateTests(unittest.TestCase):
         fixture = self.root.as_posix()
         source = (ROOT / 'files/usr/sbin/hitwh-mwan-update').read_text()
         self.script = self.root / 'update.sh'
-        self.script.write_text(rewrite_runtime_paths(source, fixture), newline='\n')
+        with self.script.open('w', newline='\n') as script_file:
+            script_file.write(rewrite_runtime_paths(source, fixture))
         bindir = self.root / 'bin'
         bindir.mkdir()
         for name in ('uci', 'ubus', 'jsonfilter', 'curl', 'ip', 'nft', 'logger'):
             file = bindir / name
-            file.write_text(f'#!/bin/sh\nexec "$MOCK_PYTHON" "$MOCK_DISPATCH" --mock {name} "$@"\n', newline='\n')
+            with file.open('w', newline='\n') as command_file:
+                command_file.write(f'#!/bin/sh\nexec "$MOCK_PYTHON" "$MOCK_DISPATCH" --mock {name} "$@"\n')
             file.chmod(0o755)
         self.env = {**os.environ, 'MOCK_STATE': self.state_path.as_posix(), 'MOCK_DISPATCH': Path(__file__).as_posix(), 'MOCK_PYTHON': Path(sys.executable).as_posix()}
         self.shell = shutil.which('sh')

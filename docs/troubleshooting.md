@@ -29,6 +29,9 @@ hitwh-mwan refresh
 hitwh-mwan list
 ```
 
+`hitwh-mwan refresh` 会先检查全部线路，仅对 `inactive` 或 `no-dhcp` 的受管线路执行
+`ifdown`/`ifup`，等待 DHCP 后再次检查。若结果仍为 `inactive`，通常需要重新认证，单纯重启接口无法绕过认证门户。
+
 ## 网关 Ping 不通
 
 `10.240.255.254` 可能过滤 ICMP。Ping 失败不能单独证明线路不可用。项目使用 HTTPS `204` 响应判断是否真正通过认证。
