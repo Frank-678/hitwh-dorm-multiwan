@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,20 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def rewrite_runtime_paths(source, fixture):
+    # Replace original paths once: the fixture itself may start with /tmp/.
+    return re.sub(r'/var/run/|/tmp/', lambda match: fixture + '/', source)
+
+
+class RuntimePathTests(unittest.TestCase):
+    def test_fixture_paths_are_not_replaced_again(self):
+        source = 'LOCK=/var/run/update.lock\nCHECKDIR="/tmp/check.$$"\n'
+        for fixture in ('/tmp/example', 'C:/Users/example/AppData/Local/Temp/example'):
+            with self.subTest(fixture=fixture):
+                expected = f'LOCK={fixture}/update.lock\nCHECKDIR="{fixture}/check.$$"\n'
+                self.assertEqual(rewrite_runtime_paths(source, fixture), expected)
 
 
 def mock_command():
@@ -103,7 +118,7 @@ class UpdateTests(unittest.TestCase):
         fixture = self.root.as_posix()
         source = (ROOT / 'files/usr/sbin/hitwh-mwan-update').read_text()
         self.script = self.root / 'update.sh'
-        self.script.write_text(source.replace('/var/run/', fixture + '/').replace('/tmp/', fixture + '/'), newline='\n')
+        self.script.write_text(rewrite_runtime_paths(source, fixture), newline='\n')
         bindir = self.root / 'bin'
         bindir.mkdir()
         for name in ('uci', 'ubus', 'jsonfilter', 'curl', 'ip', 'nft', 'logger'):
