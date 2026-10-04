@@ -2,6 +2,7 @@
 
 check:
 	./tests/check.sh
+	python3 -m unittest discover -s tests -p 'test_*.py'
 	python3 -m unittest discover -s dashboard/tests -p 'test_*.py'
 
 dashboard:
