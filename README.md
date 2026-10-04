@@ -165,6 +165,10 @@ hitwh-mwan speed 30
 
 仓库中的 `dashboard` 是一个不依赖第三方 Python 包的本地网页仪表盘。它通过一条持久 SSH 连接，每 2 秒读取一次路由器已有的状态文件、网卡字节计数和系统负载；浏览器关闭、切到后台或点击暂停后会停止采样。路由器不运行 Web 服务，也不会执行测速。
 
+运行前需要安装 Python 3.10 或更高版本，并确保 `ssh` 可用；macOS/Linux 的启动脚本使用 `python3`，Windows 的启动脚本使用 `python`。先运行 `ssh root@192.168.100.1` 确认密钥登录正常。OpenWrt 的 Dropbear 使用 `/etc/dropbear/authorized_keys` 保存 root 的授权公钥。
+
+SSH 采样脚本统一使用 UTF-8 与 LF 换行发送，避免 Windows 的 CRLF 导致远端 `sh` 报语法错误。仓库通过 `.gitattributes` 保持文本文件的 LF 换行；GitHub Actions 在 Linux、macOS、Windows 上运行回归测试并检查各自的启动脚本。
+
 macOS 或 Linux：
 
 ```sh

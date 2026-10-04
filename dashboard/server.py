@@ -311,6 +311,8 @@ class RouterCollector:
                     self.process = process
                 assert process.stdin is not None
                 assert process.stdout is not None
+                # Keep POSIX shell scripts as LF; Windows text pipes default to CRLF.
+                process.stdin.reconfigure(encoding="utf-8", newline="\n")
                 process.stdin.write(REMOTE_SCRIPT)
                 process.stdin.close()
 

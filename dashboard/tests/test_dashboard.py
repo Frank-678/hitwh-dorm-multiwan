@@ -1,7 +1,10 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import unittest
+from contextlib import ExitStack
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "server.py"
@@ -38,6 +41,37 @@ DEV\twan2\tmacwan2\t450000\t140000
 
 
 class DashboardTests(unittest.TestCase):
+    def test_collector_sends_lf_script_and_reads_text_frames(self):
+        collector = SERVER.RouterCollector("unused", 2.0)
+        frame = "\n".join([*FRAME_ONE, "@@END", ""])
+        with tempfile.TemporaryDirectory() as directory:
+            payload_path = pathlib.Path(directory) / "script.sh"
+            command = [
+                sys.executable,
+                "-c",
+                "import pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read()); "
+                "sys.stdout.write(sys.argv[2])",
+                str(payload_path),
+                frame,
+            ]
+            real_popen = SERVER.subprocess.Popen
+            with ExitStack() as processes:
+                def spawn(*args, **kwargs):
+                    return processes.enter_context(real_popen(*args, **kwargs))
+
+                with (
+                    mock.patch.object(collector, "_ssh_command", return_value=command),
+                    mock.patch.object(SERVER.time, "monotonic", side_effect=[0.0, 0.0, 11.0]),
+                    mock.patch.object(SERVER.subprocess, "Popen", side_effect=spawn),
+                ):
+                    collector._run()
+            payload = payload_path.read_bytes()
+        self.assertNotIn(b"\r", payload)
+        self.assertEqual(payload, SERVER.REMOTE_SCRIPT.encode("utf-8"))
+        self.assertEqual(collector.latest["timestamp"], 100)
+        self.assertEqual(len(collector.latest["paths"]), 2)
+
     def test_parse_frame(self):
         parsed = SERVER.parse_frame(FRAME_ONE)
         self.assertEqual(parsed["timestamp"], 100)
