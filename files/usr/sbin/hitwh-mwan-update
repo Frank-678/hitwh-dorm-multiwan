@@ -14,6 +14,7 @@ MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
 HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
 HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
 FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
+BALANCE_MODE="$(uci -q get hitwh_mwan.main.balance_mode)"
 
 [ -n "$FALLBACK_GATEWAY" ] || FALLBACK_GATEWAY=10.240.255.254
 [ -n "$MAX_PATHS" ] || MAX_PATHS=17
@@ -21,6 +22,12 @@ FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
 [ -n "$HEALTH_URL" ] || HEALTH_URL=http://connectivitycheck.gstatic.com/generate_204
 [ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
+
+[ -n "$BALANCE_MODE" ] || BALANCE_MODE=round_robin
+case "$BALANCE_MODE" in
+	round_robin|random) ;;
+	*) echo "Invalid balance_mode: $BALANCE_MODE (expected round_robin or random)" >&2; exit 2 ;;
+esac
 
 mkdir "$LOCK" 2>/dev/null || exit 0
 mkdir -p "$CHECKDIR"
@@ -181,7 +188,15 @@ set -- $ACTIVE_MARKS
 			MAP="$MAP$IDX : $MARK"
 			IDX=$((IDX + 1))
 		done
-		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto { tcp, udp } ct mark set numgen random mod $COUNT map { $MAP }"
+		if [ "$BALANCE_MODE" = round_robin ]; then
+			# Independent generators keep DNS/UDP traffic from consuming TCP slots.
+			# Existing connections retain their ct mark; only new flows are selected.
+			for PROTOCOL in tcp udp; do
+				echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto $PROTOCOL ct mark set numgen inc mod $COUNT map { $MAP }"
+			done
+		else
+			echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto { tcp, udp } ct mark set numgen random mod $COUNT map { $MAP }"
+		fi
 	fi
 	echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" meta mark set ct mark"
 	while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
@@ -204,6 +219,7 @@ fi
 {
 	date
 	echo "active_count:$COUNT"
+	echo "balance_mode:$BALANCE_MODE"
 	echo "active_interfaces:$ACTIVE_NAMES"
 	while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
 		STATE=inactive

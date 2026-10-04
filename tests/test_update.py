@@ -35,7 +35,7 @@ def mock_command():
     change = False
     if name == 'uci':
         key = args[-1]
-        values = {'hitwh_mwan.main.max_paths': '2'}
+        values = {'hitwh_mwan.main.max_paths': '2', **state.get('config', {})}
         if key.startswith('network.'):
             result = 0 if key[8:] in state['paths'] else 1
         else:
@@ -187,7 +187,7 @@ class UpdateTests(unittest.TestCase):
         self.save()
         self.run_update()
         self.assertEqual([c[0] for c in self.state['changes']], ['nft'])
-        self.assertIn('numgen random mod 2', self.state['chain'])
+        self.assertIn('numgen inc mod 2', self.state['chain'])
 
     def test_missing_interface_keeps_mark_rule_and_terminal_route(self):
         self.run_update()
@@ -208,6 +208,45 @@ class UpdateTests(unittest.TestCase):
         self.save()
         self.run_update(expected=1)
         self.assertEqual((self.root / 'hitwh-mwan.rules').read_text(), cache)
+
+    def test_round_robin_separates_tcp_udp_and_is_not_reset_on_refresh(self):
+        self.run_update()
+        self.assertIn('meta l4proto tcp ct mark set numgen inc mod 2', self.state['chain'])
+        self.assertIn('meta l4proto udp ct mark set numgen inc mod 2', self.state['chain'])
+        self.assertNotIn('numgen random', self.state['chain'])
+        self.clear_changes()
+        self.run_update()
+        self.assertEqual(self.state['changes'], [])
+
+    def test_switching_modes_changes_only_new_flow_rules(self):
+        self.run_update()
+        routes = self.state['routes'][:]
+        rules = self.state['rules'][:]
+        self.clear_changes()
+        self.state['config'] = {'hitwh_mwan.main.balance_mode': 'random'}
+        self.save()
+        self.run_update()
+        self.assertIn('numgen random mod 2', self.state['chain'])
+        self.assertEqual(self.state['routes'], routes)
+        self.assertEqual(self.state['rules'], rules)
+        self.assertEqual([c[0] for c in self.state['changes']], ['nft'])
+        self.assertIn('ct state established,related meta mark set ct mark', self.state['chain'])
+        self.clear_changes()
+        self.run_update()
+        self.assertEqual(self.state['changes'], [])
+        self.state['config']['hitwh_mwan.main.balance_mode'] = 'round_robin'
+        self.save()
+        self.run_update()
+        self.assertIn('numgen inc mod 2', self.state['chain'])
+        self.assertEqual(self.state['routes'], routes)
+        self.assertEqual(self.state['rules'], rules)
+        self.assertEqual([c[0] for c in self.state['changes']], ['nft'])
+
+    def test_invalid_mode_fails_before_network_mutations(self):
+        self.state['config'] = {'hitwh_mwan.main.balance_mode': 'invalid'}
+        self.save()
+        self.run_update(expected=2)
+        self.assertEqual(self.state['changes'], [])
 
 
 if __name__ == '__main__':
