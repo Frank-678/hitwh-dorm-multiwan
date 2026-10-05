@@ -18,6 +18,7 @@ HITwh dorm multi-WAN manager
 Usage:
   hitwh-mwan set-main AA:BB:CC:DD:EE:FF
   hitwh-mwan add AA:BB:CC:DD:EE:FF
+  hitwh-mwan edit <wan|wanN|number|old-MAC> AA:BB:CC:DD:EE:FF
   hitwh-mwan remove <number|wanN|MAC>
   hitwh-mwan list
   hitwh-mwan refresh
@@ -55,6 +56,7 @@ normalize_mac() {
 valid_mac() {
 	MAC="$1"
 	echo "$MAC" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || return 1
+	[ "$MAC" != 00:00:00:00:00:00 ] || return 1
 	FIRST="${MAC%%:*}"
 	[ $((0x$FIRST & 1)) -eq 0 ]
 }
@@ -64,6 +66,44 @@ backup_network() {
 	mkdir -p "$BACKUP_DIR"
 	chmod 700 "$BACKUP_DIR"
 	cp /etc/config/network "$BACKUP_DIR/network-$(date +%Y%m%d-%H%M%S)"
+}
+
+find_device_section() {
+	for DEV_SECTION in $(uci show network | sed -n 's/^\(network\.[^.]*\)=device$/\1/p'); do
+		[ "$(uci -q get "$DEV_SECTION.name")" = "$1" ] || continue
+		echo "$DEV_SECTION"
+		return 0
+	done
+	return 1
+}
+
+runtime_mac() {
+	normalize_mac "$(cat "/sys/class/net/$1/address" 2>/dev/null)"
+}
+
+read_main_mac() {
+	MAIN_DEVICE="$(uci -q get "network.$MAIN_INTERFACE.device")"
+	[ -n "$MAIN_DEVICE" ] || MAIN_DEVICE="$PARENT_DEVICE"
+	MAIN_DEV_SECTION="$(find_device_section "$MAIN_DEVICE" || true)"
+	MAIN_CONFIG_MAC="$(normalize_mac "$(uci -q get "network.$MAIN_INTERFACE.macaddr")")"
+	MAIN_DEVICE_MAC=""
+	[ -z "$MAIN_DEV_SECTION" ] || MAIN_DEVICE_MAC="$(normalize_mac "$(uci -q get "$MAIN_DEV_SECTION.macaddr")")"
+	MAIN_RUNTIME_MAC="$(runtime_mac "$MAIN_DEVICE")"
+}
+
+main_uses_mac() {
+	[ "$1" = "$MAIN_CONFIG_MAC" ] || [ "$1" = "$MAIN_DEVICE_MAC" ] || [ "$1" = "$MAIN_RUNTIME_MAC" ]
+}
+
+wait_for_mac() {
+	MAC_WAIT=0
+	while [ "$MAC_WAIT" -lt 5 ]; do
+		ACTUAL_MAC="$(runtime_mac "$1")"
+		[ "$ACTUAL_MAC" = "$2" ] && return 0
+		sleep 1
+		MAC_WAIT=$((MAC_WAIT + 1))
+	done
+	return 1
 }
 
 find_by_mac() {
@@ -113,39 +153,18 @@ wait_for_ip() {
 }
 
 cmd_set_main() {
-	MAC="$(normalize_mac "$1")"
-	valid_mac "$MAC" || {
-		echo "Error: invalid or multicast MAC address."
-		exit 2
-	}
-
-	wait_for_updater
-	backup_network
-	ifdown "$MAIN_INTERFACE" || true
-	uci set "network.$MAIN_INTERFACE.macaddr=$MAC"
-	uci commit network
-	/etc/init.d/network reload
-	ifup "$MAIN_INTERFACE"
-	IP="$(wait_for_ip "$MAIN_INTERFACE")"
-	run_update
-
-	if [ -n "$IP" ]; then
-		echo "Main WAN updated: MAC=$MAC IP=$IP"
-	else
-		echo "Main WAN MAC updated, but DHCP has not returned an address yet."
-	fi
+	cmd_edit "$MAIN_INTERFACE" "$1"
 }
 
 cmd_add() {
 	MAC="$(normalize_mac "$1")"
 	valid_mac "$MAC" || {
-		echo "Error: invalid or multicast MAC address."
+		echo "Error: invalid, zero or multicast MAC address."
 		exit 2
 	}
 
-	MAIN_MAC="$(normalize_mac "$(uci -q get "network.$MAIN_INTERFACE.macaddr")")"
-	[ -n "$MAIN_MAC" ] || MAIN_MAC="$(normalize_mac "$(cat "/sys/class/net/$PARENT_DEVICE/address" 2>/dev/null)")"
-	[ "$MAC" = "$MAIN_MAC" ] && {
+	read_main_mac
+	main_uses_mac "$MAC" && {
 		echo "Error: this MAC is already used by the main WAN."
 		exit 3
 	}
@@ -229,6 +248,123 @@ resolve_slot() {
 		*) echo "$ARG"; return 0 ;;
 	esac
 	return 1
+}
+
+cmd_edit() {
+	MAC="$(normalize_mac "$2")"
+	valid_mac "$MAC" || {
+		echo "Error: invalid, zero or multicast MAC address."
+		return 2
+	}
+	read_main_mac
+	EXTRA_EDIT_KEY=""
+	EXTRA_OLD_MAC=""
+	CREATE_MAIN_DEVICE=0
+
+	case "$1" in
+		"$MAIN_INTERFACE"|wan1|1)
+			EDIT_IFACE="$MAIN_INTERFACE"
+			EDIT_DEVICE="$MAIN_DEVICE"
+			EDIT_KEY="network.$MAIN_INTERFACE.macaddr"
+			OLD_MAC="$MAIN_CONFIG_MAC"
+			EXTRA_OLD_MAC="$MAIN_DEVICE_MAC"
+			if [ -n "$MAIN_DEV_SECTION" ]; then
+				EXTRA_EDIT_KEY="$MAIN_DEV_SECTION.macaddr"
+			else
+				# Modern OpenWrt applies L2 settings to device sections. Create
+				# our own only when no named/anonymous section owns this device.
+				NEW_DEV_SECTION=network.hitwh_main_device
+				if uci -q get "$NEW_DEV_SECTION" >/dev/null; then
+					echo "Error: $NEW_DEV_SECTION already configures another device."
+					return 4
+				fi
+				CREATE_MAIN_DEVICE=1
+				EXTRA_EDIT_KEY="$NEW_DEV_SECTION.macaddr"
+			fi
+			;;
+		*)
+			EDIT_SLOT="$(resolve_slot "$1" || true)"
+			case "$EDIT_SLOT" in
+				''|0*|*[!0-9]*) echo "Error: invalid WAN identifier."; return 2 ;;
+			esac
+			[ "$EDIT_SLOT" -ge 2 ] && [ "$EDIT_SLOT" -le "$MAX_PATHS" ] || {
+				echo "Error: path number is out of range."
+				return 2
+			}
+			EDIT_IFACE="wan$EDIT_SLOT"
+			EDIT_DEVICE="macwan$EDIT_SLOT"
+			EDIT_KEY="network.wan${EDIT_SLOT}dev.macaddr"
+			OLD_MAC="$(normalize_mac "$(uci -q get "$EDIT_KEY")")"
+			EXTRA_OLD_MAC="$(normalize_mac "$(uci -q get "network.$EDIT_IFACE.macaddr")")"
+			[ -z "$EXTRA_OLD_MAC" ] || EXTRA_EDIT_KEY="network.$EDIT_IFACE.macaddr"
+			;;
+	esac
+	uci -q get "network.$EDIT_IFACE" >/dev/null || {
+		echo "Error: $EDIT_IFACE does not exist."
+		return 3
+	}
+	if [ "$EDIT_IFACE" != "$MAIN_INTERFACE" ]; then
+		[ "$EDIT_SLOT" -ne 6 ] && is_managed_path "$EDIT_SLOT" || {
+			echo "Refusing to edit $EDIT_IFACE: it is not a managed HITwh multi-WAN path."
+			return 4
+		}
+	fi
+	if [ "$EDIT_IFACE" != "$MAIN_INTERFACE" ] && main_uses_mac "$MAC"; then
+		echo "Error: this MAC is already used by $MAIN_INTERFACE."
+		return 3
+	fi
+	EXISTING="$(find_by_mac "$MAC" || true)"
+	if [ -n "$EXISTING" ] && [ "wan$EXISTING" != "$EDIT_IFACE" ]; then
+		echo "Error: this MAC is already used by wan$EXISTING."
+		return 3
+	fi
+	RUNTIME_MAC="$(runtime_mac "$EDIT_DEVICE")"
+	if [ "$MAC" = "$RUNTIME_MAC" ] &&
+		{ [ -z "$OLD_MAC" ] || [ "$MAC" = "$OLD_MAC" ]; } &&
+		{ [ -z "$EXTRA_OLD_MAC" ] || [ "$MAC" = "$EXTRA_OLD_MAC" ]; }; then
+		echo "$EDIT_IFACE already uses MAC=$MAC. No changes."
+		return 0
+	fi
+
+	wait_for_updater
+	[ ! -d "$LOCK" ] || { echo "Error: the WAN updater is busy; retry shortly."; return 1; }
+	backup_network || return 1
+	if [ "$CREATE_MAIN_DEVICE" = 1 ]; then
+		uci set "$NEW_DEV_SECTION=device" || return 1
+		uci set "$NEW_DEV_SECTION.name=$EDIT_DEVICE" || return 1
+	fi
+	uci set "$EDIT_KEY=$MAC" || return 1
+	[ -z "$EXTRA_EDIT_KEY" ] || uci set "$EXTRA_EDIT_KEY=$MAC" || return 1
+	if ! uci commit network; then
+		uci -q revert "$EDIT_KEY" || true
+		[ -z "$EXTRA_EDIT_KEY" ] || uci -q revert "$EXTRA_EDIT_KEY" || true
+		[ "$CREATE_MAIN_DEVICE" = 0 ] || uci -q revert "$NEW_DEV_SECTION" || true
+		echo "Error: could not save the MAC change."
+		return 1
+	fi
+	ifdown "$EDIT_IFACE" || true
+	# Withdraw the down path and move the router's default exit before waiting
+	# for the replacement MAC's DHCP. Other paths keep their routing marks.
+	run_update >/dev/null 2>&1 || true
+	if ! /etc/init.d/network reload; then
+		ifup "$EDIT_IFACE" || true
+		echo "Error: MAC saved, but network reload failed."
+		return 1
+	fi
+	ifup "$EDIT_IFACE" || return 1
+	if ! wait_for_mac "$EDIT_DEVICE" "$MAC"; then
+		run_update >/dev/null 2>&1 || true
+		echo "Error: requested MAC=$MAC, but $EDIT_DEVICE uses MAC=${ACTUAL_MAC:-unavailable}. MAC change was not applied."
+		return 1
+	fi
+	IP="$(wait_for_ip "$EDIT_IFACE")"
+	run_update || return 1
+	if [ -n "$IP" ]; then
+		STATE="$(grep "^$EDIT_IFACE " "$STATUS_FILE" | sed -n 's/.* state=\([^ ]*\).*/\1/p')"
+		echo "Updated $EDIT_IFACE: MAC=$MAC IP=$IP state=${STATE:-unknown}"
+	else
+		echo "Updated $EDIT_IFACE: MAC=$MAC ip=none state=no-dhcp. DHCP has not returned an address yet."
+	fi
 }
 
 cmd_remove() {
@@ -375,6 +511,10 @@ case "$1" in
 	add)
 		[ -n "$2" ] || { usage; exit 1; }
 		cmd_add "$2"
+		;;
+	edit)
+		[ "$#" -eq 3 ] || { usage; exit 1; }
+		cmd_edit "$2" "$3"
 		;;
 	remove)
 		[ -n "$2" ] || { usage; exit 1; }

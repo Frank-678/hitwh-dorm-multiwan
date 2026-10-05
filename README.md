@@ -179,6 +179,10 @@ hitwh-mwan list
 # 检查并重连离线线路；在线线路不会中断
 hitwh-mwan refresh
 
+# 修改已有线路的 MAC，保留接口编号、路由表和分流标记
+hitwh-mwan edit wan2 02:11:22:33:44:62
+hitwh-mwan edit wan 02:11:22:33:44:61
+
 # 删除一条线路，三种写法均可
 hitwh-mwan remove wan4
 hitwh-mwan remove 4
@@ -190,6 +194,12 @@ hitwh-mwan speed
 # 观察 30 秒
 hitwh-mwan speed 30
 ```
+
+`edit` 接受主接口名 `wan`（或配置的 `main_interface`）、`wan1`/`1`、副接口名 `wanN`、编号或已有副 WAN 的 MAC；例如 `hitwh-mwan edit 2 新MAC` 与 `edit wan2 新MAC` 等价。新 MAC 使用带冒号的六组十六进制格式，大小写均可；必须提前完成校园网认证，并且不能被另一条 WAN 使用。脚本拒绝全零、组播 MAC 和非受管接口（包括保留的 `wan6`）。配置与网卡实际 MAC 均已匹配时不会触发重连，`set-main 新MAC` 也使用同样的检查。
+
+修改前会备份网络配置，随后重连目标接口并重新检查线路。该线路的既有连接会中断；修改主 WAN 时，共享物理父设备的副线路也可能短暂受影响。没有 DHCP 或尚未认证时，命令会显示 `no-dhcp` 或 `inactive`；修改 MAC 本身不会代替校园网登录。
+
+主 WAN 的设备配置与接口配置会同步修改，包括名为 `wanphys` 或匿名的既有设备节；没有对应设备节时创建 `hitwh_main_device`。命令检查 `/sys/class/net/设备名/address` 中的实际 MAC：只有配置与实际设备都匹配时才跳过重连；若重连后实际 MAC 没有变成目标值，则报错，不把仅写入配置视为成功。
 
 ## 本地可视化监控
 
