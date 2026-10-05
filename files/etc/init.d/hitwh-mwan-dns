@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+
+# dnsmasq starts at 19 and needs its volatile servers-file to exist at boot.
+START=18
+
+start() {
+	DNS_FILE=/var/run/hitwh-mwan.dns
+	[ "$(uci -q get 'dhcp.@dnsmasq[0].serversfile')" = "$DNS_FILE" ] || return 0
+	touch "$DNS_FILE"
+	chmod 644 "$DNS_FILE"
+}

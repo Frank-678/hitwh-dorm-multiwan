@@ -19,10 +19,24 @@ mkdir -p "$BACKUP_DIR"
 chmod 700 /root/hitwh-mwan-backups "$BACKUP_DIR"
 cp /etc/config/network "$BACKUP_DIR/network"
 cp /etc/config/firewall "$BACKUP_DIR/firewall"
+[ ! -f /etc/config/dhcp ] || cp /etc/config/dhcp "$BACKUP_DIR/dhcp"
 [ ! -f /etc/config/hitwh_mwan ] || cp /etc/config/hitwh_mwan "$BACKUP_DIR/hitwh_mwan"
 
 /etc/init.d/hitwh-mwan stop >/dev/null 2>&1 || true
 /etc/init.d/hitwh-mwan disable >/dev/null 2>&1 || true
+/etc/init.d/hitwh-mwan-dns disable >/dev/null 2>&1 || true
+
+for PRIORITY in 32000 32001; do
+	while ip -4 rule show | grep -q "^$PRIORITY:"; do
+		ip -4 rule del priority "$PRIORITY"
+	done
+done
+if [ "$(uci -q get 'dhcp.@dnsmasq[0].serversfile' || true)" = /var/run/hitwh-mwan.dns ]; then
+	uci -q delete 'dhcp.@dnsmasq[0].serversfile'
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload
+fi
+rm -f /var/run/hitwh-mwan.dns
 
 WAN_ZONE=""
 for Z in $(uci show firewall | sed -n "s/^\(firewall\.[^.]*\)=zone$/\1/p"); do
@@ -56,11 +70,13 @@ rm -f \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \
 	/etc/init.d/hitwh-mwan \
+	/etc/init.d/hitwh-mwan-dns \
 	/etc/hotplug.d/iface/95-hitwh-mwan \
 	/usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft \
 	/etc/config/hitwh_mwan
 
 for PATH_TO_REMOVE in \
+	/etc/init.d/hitwh-mwan-dns \
 	/usr/sbin/hitwh-mwan \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \

@@ -277,6 +277,11 @@ cmd_list() {
 
 print_status() {
 	cat "$STATUS_FILE"
+	if ! grep -q "^$MAIN_INTERFACE " "$STATUS_FILE"; then
+		MAC="$(uci -q get "network.$MAIN_INTERFACE.macaddr")"
+		[ -n "$MAC" ] || MAC="$(cat "/sys/class/net/$PARENT_DEVICE/address" 2>/dev/null)"
+		echo "$MAIN_INTERFACE mac=$MAC ip=none state=no-dhcp mark=0x101"
+	fi
 
 	N=2
 	while [ "$N" -le "$MAX_PATHS" ]; do

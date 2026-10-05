@@ -44,15 +44,30 @@ def mock_command():
     elif name == 'ubus':
         iface = args[1].split('.')[-1]
         path = state['paths'].get(iface)
-        output = json.dumps({'l3_device': path['dev'], 'ipv4-address': [{'address': path['ip']}], 'route': [{'nexthop': state['gateway']}]}) if path else '{}'
+        output = json.dumps({'l3_device': path['dev'], 'ipv4-address': [{'address': path['ip']}], 'route': [{'nexthop': state['gateway']}], 'dns-server': path.get('dns', []), 'inactive': {'dns-server': path.get('inactive_dns', [])}}) if path else '{}'
     elif name == 'jsonfilter':
         data = json.load(sys.stdin)
-        expression = args[-1]
-        if expression == '@.l3_device': output = data.get('l3_device', '')
-        elif 'ipv4-address' in expression: output = data.get('ipv4-address', [{}])[0].get('address', '')
-        elif expression == '@.route[0].nexthop': output = data.get('route', [{}])[0].get('nexthop', '')
+        rows = []
+        for index, arg in enumerate(args):
+            if arg != '-e': continue
+            expression = args[index + 1]
+            if expression == '@.l3_device': rows.append(data.get('l3_device', ''))
+            elif 'ipv4-address' in expression: rows.append(data.get('ipv4-address', [{}])[0].get('address', ''))
+            elif expression == '@.route[0].nexthop': rows.append(data.get('route', [{}])[0].get('nexthop', ''))
+            elif expression == '@["dns-server"][*]': rows.extend(data.get('dns-server', []))
+            elif expression == '@.inactive["dns-server"][*]': rows.extend(data.get('inactive', {}).get('dns-server', []))
+        output = '\n'.join(rows)
     elif name == 'curl':
-        output = '500' if args[args.index('--interface') + 1] in state['unhealthy'] else '204'
+        source = args[args.index('--interface') + 1]
+        dns_ok = True
+        if state.get('require_path_dns'):
+            dnsfile = Path(state['config']['dhcp.@dnsmasq[0].serversfile'])
+            contents = dnsfile.read_text() if dnsfile.exists() else ''
+            dns_ok = any('@' + path['ip'] in contents and path['ip'] not in state['unhealthy'] for path in state['paths'].values())
+        output = '000' if not dns_ok else ('500' if source in state['unhealthy'] else '204')
+    elif name == 'killall':
+        if args != ['-HUP', 'dnsmasq']: raise AssertionError(args)
+        change = True
     elif name == 'logger':
         pass
     elif name == 'nft':
@@ -74,6 +89,10 @@ def mock_command():
                 selector = ' '.join(rest[2:])
                 entry = [priority, selector]
                 if action == 'add': state['rules'].append(entry)
+                elif not selector:
+                    entry = next((r for r in state['rules'] if r[0] == priority), None)
+                    if entry: state['rules'].remove(entry)
+                    else: result = 1
                 elif entry in state['rules']: state['rules'].remove(entry)
                 else: result = 1
         elif kind == 'route':
@@ -103,7 +122,7 @@ def mock_command():
     if change:
         state['changes'].append([name, *sys.argv[3:]])
         state_path.write_text(json.dumps(state))
-    if output: print(output, end='' if name == 'curl' else '\n')
+    if output: sys.stdout.buffer.write((output + ('' if name == 'curl' else '\n')).encode('utf-8'))
     raise SystemExit(result)
 
 
@@ -122,7 +141,7 @@ class UpdateTests(unittest.TestCase):
             script_file.write(rewrite_runtime_paths(source, fixture))
         bindir = self.root / 'bin'
         bindir.mkdir()
-        for name in ('uci', 'ubus', 'jsonfilter', 'curl', 'ip', 'nft', 'logger'):
+        for name in ('uci', 'ubus', 'jsonfilter', 'curl', 'ip', 'nft', 'logger', 'killall'):
             file = bindir / name
             with file.open('w', newline='\n') as command_file:
                 command_file.write(f'#!/bin/sh\nexec "$MOCK_PYTHON" "$MOCK_DISPATCH" --mock {name} "$@"\n')
@@ -149,7 +168,7 @@ class UpdateTests(unittest.TestCase):
 
     def test_unchanged_paths_do_not_mutate_routes_rules_or_nft(self):
         self.run_update()
-        self.assertEqual(len(self.state['rules']), 4)
+        self.assertEqual(len(self.state['rules']), 6)
         self.clear_changes()
         self.run_update()
         self.assertEqual(self.state['changes'], [])
@@ -247,6 +266,165 @@ class UpdateTests(unittest.TestCase):
         self.save()
         self.run_update(expected=2)
         self.assertEqual(self.state['changes'], [])
+
+    def status(self):
+        return (self.root / 'hitwh-mwan.status').read_text()
+
+    def router_rule(self):
+        return [r for r in self.state['rules'] if r[0] == 32001]
+
+    def enable_dns(self):
+        self.state['config'] = {'dhcp.@dnsmasq[0].serversfile': (self.root / 'hitwh-mwan.dns').as_posix()}
+        self.state['paths']['wan']['dns'] = ['172.26.26.3']
+        self.state['paths']['wan2']['inactive_dns'] = ['172.26.26.3', '219.146.1.66']
+        self.state['require_path_dns'] = True
+        self.save()
+
+    def test_main_failure_switches_router_and_recovery_switches_back(self):
+        self.run_update()
+        original_routes = self.state['routes'][:]
+        self.assertIn('router_interface:wan\n', self.status())
+        self.clear_changes()
+        self.state['unhealthy'] = ['10.0.0.2']
+        self.save()
+        self.run_update()
+        self.assertEqual(self.router_rule(), [[32001, 'from all fwmark 0/0xfff iif lo lookup 102']])
+        self.assertIn([32000, 'from all lookup main suppress_prefixlength 0'], self.state['rules'])
+        self.assertIn('router_interface:wan2\n', self.status())
+        self.assertEqual(self.state['routes'], original_routes)
+        self.assertIn([1101, 'from all fwmark 0x101/0xfff lookup 101'], self.state['rules'])
+        switch = [c for c in self.state['changes'] if c[0] == 'ip']
+        self.assertEqual([c[3] for c in switch], ['add', 'del'])
+        self.clear_changes()
+        self.run_update()
+        self.assertEqual(self.state['changes'], [])
+        self.state['unhealthy'] = []
+        self.save()
+        self.run_update()
+        self.assertEqual(self.router_rule(), [[32001, 'from all fwmark 0/0xfff iif lo lookup 101']])
+        self.assertIn('router_interface:wan\n', self.status())
+
+    def test_backup_failure_selects_another_and_keeps_it_when_first_recovers(self):
+        self.state['config'] = {'hitwh_mwan.main.max_paths': '3'}
+        self.state['paths']['wan3'] = {'dev': 'macwan3', 'ip': '10.0.0.4'}
+        self.state['unhealthy'] = ['10.0.0.2']
+        self.save()
+        self.run_update()
+        self.assertIn('router_interface:wan2\n', self.status())
+        self.state['unhealthy'].append('10.0.0.3')
+        self.save()
+        self.run_update()
+        self.assertIn('router_interface:wan3\n', self.status())
+        self.state['unhealthy'] = ['10.0.0.2']
+        self.save()
+        self.run_update()
+        self.assertIn('router_interface:wan3\n', self.status())
+
+    def test_cold_boot_without_main_dhcp_uses_backup_dns_before_health(self):
+        self.enable_dns()
+        del self.state['paths']['wan']
+        self.save()
+        self.run_update()
+        self.assertIn('active_count:1\n', self.status())
+        self.assertIn('router_interface:wan2\n', self.status())
+        self.assertIn('router_dns_configured:1\n', self.status())
+        dnsfile = self.root / 'hitwh-mwan.dns'
+        self.assertEqual(dnsfile.read_text(), 'server=172.26.26.3@10.0.0.3\nserver=219.146.1.66@10.0.0.3\n')
+        self.clear_changes()
+        self.run_update()
+        self.assertEqual(self.state['changes'], [])
+
+    def test_dhcp_dns_address_change_refreshes_only_changed_dns_file(self):
+        self.enable_dns()
+        self.run_update()
+        self.clear_changes()
+        self.state['paths']['wan2']['ip'] = '10.0.0.4'
+        self.save()
+        self.run_update()
+        dns = (self.root / 'hitwh-mwan.dns').read_text()
+        self.assertNotIn('@10.0.0.3', dns)
+        self.assertIn('@10.0.0.4', dns)
+        self.assertEqual(sum(c[0] == 'killall' for c in self.state['changes']), 1)
+
+    def test_all_health_checks_fail_keeps_previous_exit_as_unverified(self):
+        self.state['unhealthy'] = ['10.0.0.2']
+        self.save()
+        self.run_update()
+        previous_rule = self.router_rule()
+        self.state['unhealthy'].append('10.0.0.3')
+        self.save()
+        self.run_update()
+        self.assertEqual(self.router_rule(), previous_rule)
+        self.assertIn('router_state:unverified\n', self.status())
+        self.assertIn('active_count:0\n', self.status())
+        self.assertNotIn('ct state new', self.state['chain'])
+
+    def test_cold_boot_without_healthy_paths_does_not_promote_one(self):
+        self.state['unhealthy'] = ['10.0.0.2', '10.0.0.3']
+        self.save()
+        self.run_update()
+        self.assertEqual(self.router_rule(), [])
+        self.assertIn('router_state:unavailable\n', self.status())
+        self.assertIn('active_count:0\n', self.status())
+
+    def test_no_dhcp_on_any_path_publishes_zero_and_removes_router_rules(self):
+        self.run_update()
+        self.state['paths'] = {}
+        self.state['routes'] = [r for r in self.state['routes'] if r['guard']]
+        self.save()
+        self.run_update()
+        self.assertEqual(self.router_rule(), [])
+        self.assertIn('router_state:unavailable\n', self.status())
+        self.assertIn('active_count:0\n', self.status())
+        self.assertIn([1102, 'from all fwmark 0x102/0xfff lookup 102'], self.state['rules'])
+
+    def test_disabling_failover_removes_only_router_rules_and_dns(self):
+        self.enable_dns()
+        self.run_update()
+        self.clear_changes()
+        self.state['config']['hitwh_mwan.main.router_failover'] = '0'
+        self.state['require_path_dns'] = False
+        self.save()
+        self.run_update()
+        self.assertEqual(len(self.state['rules']), 4)
+        self.assertEqual(self.router_rule(), [])
+        self.assertEqual((self.root / 'hitwh-mwan.dns').read_text(), '')
+        self.assertIn('router_state:disabled\n', self.status())
+        self.assertFalse(any(c[0] == 'ip' and c[1] == '-4' and c[2] == 'route' for c in self.state['changes']))
+
+    def test_custom_dns_serversfile_is_not_overwritten(self):
+        custom = self.root / 'custom.dns'
+        custom.write_text('server=192.0.2.1\n')
+        self.state['config'] = {'dhcp.@dnsmasq[0].serversfile': custom.as_posix()}
+        self.save()
+        self.run_update()
+        self.assertEqual(custom.read_text(), 'server=192.0.2.1\n')
+        self.assertIn('router_dns_configured:0\n', self.status())
+
+    def test_invalid_failover_option_fails_before_network_mutations(self):
+        self.state['config'] = {'hitwh_mwan.main.router_failover': 'invalid'}
+        self.save()
+        self.run_update(expected=2)
+        self.assertEqual(self.state['changes'], [])
+
+    def test_early_dns_service_creates_file_and_preserves_existing_contents(self):
+        self.enable_dns()
+        boot_source = (ROOT / 'files/etc/init.d/hitwh-mwan-dns').read_text()
+        with self.script.open('w', newline='\n') as script_file:
+            script_file.write(rewrite_runtime_paths(boot_source, self.root.as_posix()) + '\nstart\n')
+        self.run_update()
+        dnsfile = self.root / 'hitwh-mwan.dns'
+        self.assertEqual(dnsfile.read_text(), '')
+        dnsfile.write_text('server=172.26.26.3@10.0.0.3\n')
+        self.run_update()
+        self.assertEqual(dnsfile.read_text(), 'server=172.26.26.3@10.0.0.3\n')
+
+    def test_early_dns_service_leaves_custom_dns_setup_alone(self):
+        boot_source = (ROOT / 'files/etc/init.d/hitwh-mwan-dns').read_text()
+        with self.script.open('w', newline='\n') as script_file:
+            script_file.write(rewrite_runtime_paths(boot_source, self.root.as_posix()) + '\nstart\n')
+        self.run_update()
+        self.assertFalse((self.root / 'hitwh-mwan.dns').exists())
 
 
 if __name__ == '__main__':

@@ -32,9 +32,24 @@ hitwh-mwan list
 `hitwh-mwan refresh` 会先检查全部线路，仅对 `inactive` 或 `no-dhcp` 的受管线路执行
 `ifdown`/`ifup`，等待 DHCP 后再次检查。若结果仍为 `inactive`，通常需要重新认证，单纯重启接口无法绕过认证门户。
 
+## 主 WAN 掉线，刷新无效
+
+先执行 `hitwh-mwan list`。主 WAN 有地址但 `state=inactive` 通常是校园网认证失效；刷新只能重启接口，不能重新提交认证。主 WAN 需按上面的步骤重新认证其原 MAC。
+
+新版默认启用 `router_failover=1`：主 WAN 离线时，客户端新连接使用其他在线出口，路由器自身默认出口也会切到健康副 WAN。主 WAN 恢复后自动切回，无需把副 WAN 的 MAC 复制到物理 WAN。查看状态：
+
+```sh
+hitwh-mwan list
+ip -4 route get 1.1.1.1
+```
+
+`router_interface:wan2` 表示当前使用 wan2 作为本机默认出口；`ip route show table main` 仍可能显示原主 WAN，这不代表切换失败，实际由策略规则决定。`router_dns_configured:1` 表示已接入各线路的源地址绑定 DNS；值为 `0` 时检查是否未运行新版安装器，或 dnsmasq 已使用自定义 `serversfile`。后者需要自行保证 DNS 可以在没有主 WAN 时工作。
+
+所有检查失败时不会提升未知线路：`router_state=unverified` 仅表示保留了上次仍有地址的出口；`unavailable` 表示没有可保留的出口。失效线路上的旧连接需要重新建立。
+
 ## 网关 Ping 不通
 
-`10.240.255.254` 可能过滤 ICMP。Ping 失败不能单独证明线路不可用。项目使用 HTTPS `204` 响应判断是否真正通过认证。
+`10.240.255.254` 可能过滤 ICMP。Ping 失败不能单独证明线路不可用。项目使用配置的 `204` 检查页判断是否真正通过认证，默认使用 HTTP。
 
 可以检查 ARP 邻居：
 

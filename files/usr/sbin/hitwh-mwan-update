@@ -7,6 +7,9 @@ RULES="/tmp/hitwh-mwan-rules.$$"
 RULES_STATE=/var/run/hitwh-mwan.rules
 NFT_STATE=/var/run/hitwh-mwan.nft-state
 NFT_CURRENT="/tmp/hitwh-mwan-nft.$$"
+DNS_FILE=/var/run/hitwh-mwan.dns
+DNS_CURRENT="/tmp/hitwh-mwan-dns.$$"
+STATUS_FILE=/tmp/hitwh-mwan.status
 
 MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
 LAN_DEVICE="$(uci -q get hitwh_mwan.main.lan_device)"
@@ -15,6 +18,7 @@ HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
 HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
 FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
 BALANCE_MODE="$(uci -q get hitwh_mwan.main.balance_mode)"
+ROUTER_FAILOVER="$(uci -q get hitwh_mwan.main.router_failover)"
 
 [ -n "$FALLBACK_GATEWAY" ] || FALLBACK_GATEWAY=10.240.255.254
 [ -n "$MAX_PATHS" ] || MAX_PATHS=17
@@ -22,6 +26,11 @@ BALANCE_MODE="$(uci -q get hitwh_mwan.main.balance_mode)"
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
 [ -n "$HEALTH_URL" ] || HEALTH_URL=http://connectivitycheck.gstatic.com/generate_204
 [ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
+[ -n "$ROUTER_FAILOVER" ] || ROUTER_FAILOVER=1
+case "$ROUTER_FAILOVER" in
+	0|1) ;;
+	*) echo "Invalid router_failover: $ROUTER_FAILOVER (expected 0 or 1)" >&2; exit 2 ;;
+esac
 
 [ -n "$BALANCE_MODE" ] || BALANCE_MODE=round_robin
 case "$BALANCE_MODE" in
@@ -32,7 +41,7 @@ esac
 mkdir "$LOCK" 2>/dev/null || exit 0
 mkdir -p "$CHECKDIR"
 : >"$PATHFILE"
-trap 'rm -rf "$LOCK" "$CHECKDIR" "$PATHFILE" "$RULES" "$NFT_CURRENT"' EXIT INT TERM
+trap 'rm -rf "$LOCK" "$CHECKDIR" "$PATHFILE" "$RULES" "$NFT_CURRENT" "$DNS_CURRENT"' EXIT INT TERM
 
 iface_status() {
 	ubus call "network.interface.$1" status 2>/dev/null
@@ -96,6 +105,88 @@ ensure_rule() {
 	done
 }
 
+remove_router_rules() {
+	# These two priorities belong only to the router's default-exit selector.
+	for ROUTER_PRIORITY in 32000 32001; do
+		while ip -4 rule show | grep -q "^$ROUTER_PRIORITY:"; do
+			ip -4 rule del priority "$ROUTER_PRIORITY" || return 1
+		done
+	done
+}
+
+update_router_dns() {
+	DNS_CONFIGURED=0
+	[ "$(uci -q get 'dhcp.@dnsmasq[0].serversfile')" = "$DNS_FILE" ] || return 0
+	DNS_CONFIGURED=1
+	: >"$DNS_CURRENT"
+	if [ "$ROUTER_FAILOVER" = 1 ]; then
+		while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+			DNS_STATUS="$(iface_status "$IFACE")"
+			# peerdns=0 keeps DHCP DNS in inactive; it is still usable when
+			# explicitly bound to this path's address and source-routing rule.
+			for SERVER in $(printf '%s\n' "$DNS_STATUS" | jsonfilter \
+				-e '@["dns-server"][*]' -e '@.inactive["dns-server"][*]' 2>/dev/null | sort -u); do
+				case "$SERVER" in
+					''|*[!0-9.]*) continue ;;
+				esac
+				printf 'server=%s@%s\n' "$SERVER" "$IP" >>"$DNS_CURRENT"
+			done
+		done <"$PATHFILE"
+	fi
+	if ! cmp -s "$DNS_CURRENT" "$DNS_FILE"; then
+		# Keep the inode: OpenWrt may bind-mount this file into dnsmasq's jail.
+		cp "$DNS_CURRENT" "$DNS_FILE" || return 1
+		# servers-file is re-read on SIGHUP, without restarting DHCP or WANs.
+		killall -HUP dnsmasq 2>/dev/null || true
+	fi
+}
+
+select_router_path() {
+	ROUTER_INTERFACE=""
+	ROUTER_STATE=unavailable
+	PREVIOUS_ROUTER="$(sed -n 's/^router_interface://p' "$STATUS_FILE" 2>/dev/null)"
+	ROUTER_PATH=""
+	# Prefer the configured main WAN, then retain a healthy backup to avoid
+	# unnecessary switches when an unrelated lower-numbered path recovers.
+	for PREFERRED in "$MAIN_INTERFACE" "$PREVIOUS_ROUTER"; do
+		[ -n "$PREFERRED" ] || continue
+		while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+			if [ "$IFACE" = "$PREFERRED" ] && [ -f "$CHECKDIR/$N.ok" ]; then
+				ROUTER_PATH="$N|$IFACE|$DEV|$IP|$TABLE|$MARK|$MAC"
+				break
+			fi
+		done <"$PATHFILE"
+		[ -z "$ROUTER_PATH" ] || break
+	done
+	if [ -z "$ROUTER_PATH" ]; then
+		while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
+			[ -f "$CHECKDIR/$N.ok" ] || continue
+			ROUTER_PATH="$N|$IFACE|$DEV|$IP|$TABLE|$MARK|$MAC"
+			break
+		done <"$PATHFILE"
+	fi
+	if [ -n "$ROUTER_PATH" ]; then
+		ROUTER_STATE=active
+	else
+		# An endpoint outage is not proof that every link died. Keep a
+		# previous exit with an address, but never promote an unverified one.
+		ROUTER_PATH="$(awk -F '|' -v iface="$PREVIOUS_ROUTER" '$2 == iface { print; exit }' "$PATHFILE")"
+		[ -z "$ROUTER_PATH" ] || ROUTER_STATE=unverified
+	fi
+	if [ "$ROUTER_FAILOVER" = 0 ] || [ -z "$ROUTER_PATH" ]; then
+		remove_router_rules || return 1
+		[ "$ROUTER_FAILOVER" = 1 ] || ROUTER_STATE=disabled
+		return 0
+	fi
+	ROUTER_INTERFACE="$(printf '%s\n' "$ROUTER_PATH" | cut -d '|' -f2)"
+	ROUTER_TABLE="$(printf '%s\n' "$ROUTER_PATH" | cut -d '|' -f5)"
+	# Preserve LAN and other specific main-table routes before consulting a
+	# WAN table, which has a catch-all default. iif lo selects local traffic;
+	# source-bound probes and existing marked flows match their earlier rules.
+	ensure_rule 32000 from all lookup main suppress_prefixlength 0 || return 1
+	ensure_rule 32001 from all fwmark 0/0xfff iif lo lookup "$ROUTER_TABLE" || return 1
+}
+
 setup_path() {
 	N="$1"
 	IFACE="$2"
@@ -138,10 +229,13 @@ for TABLE in $(ip -4 rule show | awk -v max="$((100 + MAX_PATHS))" '
 	ensure_guard "$TABLE" || exit 1
 done
 
+# DNS must work before the health checks, including at boot with no main DHCP.
+update_router_dns || exit 1
+
 # Check every path in parallel. A captive-portal response is not considered online.
 while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
 	(
-		CODE="$(curl -sS --interface "$IP" --connect-timeout 4 --max-time 7 \
+		CODE="$(curl -4 -sS --interface "$IP" --connect-timeout 4 --max-time 7 \
 			-o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null)"
 		[ "$CODE" = "$HEALTH_CODE" ] && : >"$CHECKDIR/$N.ok"
 	) &
@@ -159,16 +253,7 @@ while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
 	fi
 done <"$PATHFILE"
 
-# If the public health endpoint itself is unavailable, retain the first path.
-if [ "$COUNT" -eq 0 ]; then
-	FIRST="$(head -n 1 "$PATHFILE")"
-	[ -n "$FIRST" ] || exit 1
-	MARK="$(echo "$FIRST" | cut -d'|' -f6)"
-	IFACE="$(echo "$FIRST" | cut -d'|' -f2)"
-	ACTIVE_MARKS=" $MARK"
-	ACTIVE_NAMES=" $IFACE"
-	COUNT=1
-fi
+select_router_path || exit 1
 
 if ! nft list table inet hitwh_mwan >/dev/null 2>&1; then
 	nft -f /usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft
@@ -180,7 +265,7 @@ set -- $ACTIVE_MARKS
 	echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state established,related meta mark set ct mark"
 	if [ "$COUNT" -eq 1 ]; then
 		echo "add rule inet hitwh_mwan prerouting iifname \"$LAN_DEVICE\" ct state new ct mark 0 meta l4proto { tcp, udp } ct mark set $1"
-	else
+	elif [ "$COUNT" -gt 1 ]; then
 		MAP=""
 		IDX=0
 		for MARK in "$@"; do
@@ -221,11 +306,15 @@ fi
 	echo "active_count:$COUNT"
 	echo "balance_mode:$BALANCE_MODE"
 	echo "active_interfaces:$ACTIVE_NAMES"
+	echo "router_failover:$ROUTER_FAILOVER"
+	echo "router_interface:$ROUTER_INTERFACE"
+	echo "router_state:$ROUTER_STATE"
+	echo "router_dns_configured:$DNS_CONFIGURED"
 	while IFS='|' read -r N IFACE DEV IP TABLE MARK MAC; do
 		STATE=inactive
 		[ -f "$CHECKDIR/$N.ok" ] && STATE=active
 		echo "$IFACE mac=$MAC ip=$IP state=$STATE mark=$MARK"
 	done <"$PATHFILE"
-} >/tmp/hitwh-mwan.status
+} >"$STATUS_FILE"
 
 logger -t hitwh-mwan "active interfaces:$ACTIVE_NAMES"

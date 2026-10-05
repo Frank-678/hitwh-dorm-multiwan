@@ -17,6 +17,7 @@ FILES='files/usr/sbin/hitwh-mwan
 files/usr/sbin/hitwh-mwan-update
 files/usr/sbin/hitwh-mwan-monitor
 files/etc/init.d/hitwh-mwan
+files/etc/init.d/hitwh-mwan-dns
 files/etc/hotplug.d/iface/95-hitwh-mwan
 files/usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft
 files/etc/config/hitwh_mwan'
@@ -41,6 +42,7 @@ mkdir -p "$BACKUP_DIR"
 chmod 700 /root/hitwh-mwan-backups "$BACKUP_DIR"
 cp /etc/config/network "$BACKUP_DIR/network"
 cp /etc/config/firewall "$BACKUP_DIR/firewall"
+[ ! -f /etc/config/dhcp ] || cp /etc/config/dhcp "$BACKUP_DIR/dhcp"
 [ ! -f /etc/config/hitwh_mwan ] || cp /etc/config/hitwh_mwan "$BACKUP_DIR/hitwh_mwan"
 echo "$LEGACY_FILES" | while IFS= read -r LEGACY; do
 	[ -f "$LEGACY" ] || continue
@@ -87,10 +89,32 @@ chmod 755 \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \
 	/etc/init.d/hitwh-mwan \
+	/etc/init.d/hitwh-mwan-dns \
 	/etc/hotplug.d/iface/95-hitwh-mwan
 chmod 644 \
 	/etc/config/hitwh_mwan \
 	/usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft
+
+# Give dnsmasq source-bound DHCP resolvers from every addressed path. Leave an
+# existing custom serversfile alone; its resolver setup remains user-managed.
+DNS_FILE=/var/run/hitwh-mwan.dns
+ROUTER_FAILOVER="$(uci -q get hitwh_mwan.main.router_failover || true)"
+[ -n "$ROUTER_FAILOVER" ] || ROUTER_FAILOVER=1
+if [ "$ROUTER_FAILOVER" = 1 ] && [ "$(uci -q get 'dhcp.@dnsmasq[0]' || true)" = dnsmasq ]; then
+	SERVERS_FILE="$(uci -q get 'dhcp.@dnsmasq[0].serversfile' || true)"
+	if [ -z "$SERVERS_FILE" ] || [ "$SERVERS_FILE" = "$DNS_FILE" ]; then
+		touch "$DNS_FILE"
+		chmod 644 "$DNS_FILE"
+		if [ "$SERVERS_FILE" != "$DNS_FILE" ]; then
+			uci set "dhcp.@dnsmasq[0].serversfile=$DNS_FILE"
+			uci commit dhcp
+			/etc/init.d/dnsmasq reload
+		fi
+		/etc/init.d/hitwh-mwan-dns enable
+	else
+		echo "Keeping custom dnsmasq serversfile: $SERVERS_FILE. Ensure its DNS works without the main WAN."
+	fi
+fi
 
 PREV_FLOW="$(uci -q get firewall.@defaults[0].flow_offloading || true)"
 PREV_FLOW_HW="$(uci -q get firewall.@defaults[0].flow_offloading_hw || true)"
@@ -104,6 +128,7 @@ uci set firewall.@defaults[0].flow_offloading_hw='0'
 uci commit firewall
 
 for PATH_TO_KEEP in \
+	/etc/init.d/hitwh-mwan-dns \
 	/usr/sbin/hitwh-mwan \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \
