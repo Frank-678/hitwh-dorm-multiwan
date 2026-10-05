@@ -46,14 +46,16 @@ class DashboardTests(unittest.TestCase):
     def test_launcher_prints_utf8_help_with_legacy_locale(self):
         if os.name == "nt":
             command = [
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                 "-File", str(MODULE_PATH.parent / "start.ps1"), "--help",
             ]
         else:
             command = ["sh", str(MODULE_PATH.parent / "start.command"), "--help"]
         env = dict(os.environ, PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", LC_ALL="C")
         env.pop("PYTHONIOENCODING", None)
-        result = subprocess.run(command, env=env, capture_output=True, timeout=10)
+        # Cold PowerShell/Python startup can exceed 10s on hosted Windows runners.
+        timeout = 60 if os.name == "nt" else 10
+        result = subprocess.run(command, env=env, capture_output=True, timeout=timeout)
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
         self.assertIn(SERVER.build_parser().description, result.stdout.decode("utf-8"))
 
