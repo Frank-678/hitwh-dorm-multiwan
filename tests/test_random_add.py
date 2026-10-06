@@ -114,6 +114,29 @@ class RandomAddTests(unittest.TestCase):
         self.assertTrue((self.root / 'private/auth.d/wan4.json').exists())
         self.assertEqual(self.state['random_calls'], 1)
 
+    def test_vendor_firewall_nonzero_with_live_new_path_rules_allows_authentication(self):
+        self.free_slot(); self.state['firewall_reload_status'] = 1; self.save()
+        output = self.run_manager('add', 'random')
+        self.assertIn('new WAN forwarding and NAT rules verified', output)
+        self.assertEqual(self.logins(), [['auth', 'login', 'wan4']])
+        self.assertIn('network.wan4', self.state['config'])
+
+    def test_firewall_validation_or_missing_live_rules_roll_back_before_login(self):
+        for attempt, failure in enumerate(('firewall_validation_failure', 'missing_live_path_rules', 'missing_live_path_nat')):
+            with self.subTest(failure=failure):
+                self.free_slot(); self.state[failure] = True
+                self.state['random_calls'] = 0
+                self.state['random_candidates'] = [f'{16 + attempt:02x}:20:30:40:50']; self.save()
+                self.assertIn('Error: new WAN firewall', self.run_manager('add', 'random', expected=1))
+                self.assertNotIn('network.wan4', self.state['config'])
+                self.assertFalse((self.root / 'private/auth.d/wan4.json').exists())
+                self.assertFalse(self.logins())
+                # The shared fixture keeps device files; netifd removes them on rollback.
+                import shutil
+                shutil.rmtree(self.root / 'sys/macwan4', ignore_errors=True)
+                self.state.pop(failure)
+                self.save()
+
     def test_remove_deletes_credentials_but_history_prevents_mac_reuse(self):
         self.free_slot(); self.run_manager('add', 'random')
         self.run_manager('remove', 'wan4')

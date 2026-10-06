@@ -214,14 +214,32 @@ create_random_path() {
 	uci add_list "$ZONE.network=$NEW_IFACE" &&
 	"$AUTH_COMMAND" import "$NEW_IFACE" <"$PENDING_DIR/value.json" &&
 	uci commit network && uci commit firewall &&
-	/etc/init.d/network reload && ifup "$NEW_IFACE" &&
-	/etc/init.d/firewall reload
+	/etc/init.d/network reload && ifup "$NEW_IFACE"
+}
+
+reload_firewall_for_path() {
+	# Validate before applying; a vendor wrapper may return the status of a
+	# missing optional include after nft has successfully loaded the rules.
+	fw4 -q check || { echo 'Error: new WAN firewall validation failed.' >&2; return 1; }
+	FIREWALL_CODE=0
+	/etc/init.d/firewall reload || FIREWALL_CODE=$?
+	# Require this newly allocated device in both forwarding and NAT dispatch.
+	# Existing fw4 tables alone cannot prove that this reload took effect.
+	nft list chain inet fw4 accept_to_wan 2>/dev/null |
+		grep -F "\"$NEW_DEVICE\"" | grep -q ' accept' &&
+	nft list chain inet fw4 srcnat 2>/dev/null |
+		grep -F "\"$NEW_DEVICE\"" | grep -q 'jump srcnat_wan' || {
+		echo 'Error: new WAN firewall rules were not loaded; rolling back.' >&2; return 1;
+	}
+	[ "$FIREWALL_CODE" = 0 ] ||
+		echo 'Firewall wrapper returned nonzero; new WAN forwarding and NAT rules verified.' >&2
+	return 0
 }
 
 cmd_add_random() {
 	# Fail before prompting when there is no capacity or required runtime.
 	find_free_slot >/dev/null || { echo 'Error: no free WAN slot.' >&2; return 4; }
-	for REQUIRED in flock stat hexdump uci ubus jsonfilter curl ifup ifdown; do
+	for REQUIRED in flock stat hexdump uci ubus jsonfilter curl ifup ifdown fw4 nft; do
 		command -v "$REQUIRED" >/dev/null || { echo "Error: missing $REQUIRED." >&2; return 1; }
 	done
 	[ -r /dev/urandom ] && [ -x "$AUTH_COMMAND" ] && [ -x "$UPDATE_COMMAND" ] &&
@@ -264,6 +282,7 @@ cmd_add_random() {
 	if ! wait_for_mac "$NEW_DEVICE" "$NEW_MAC"; then
 		echo 'Error: new WAN device MAC did not apply; rolling back.' >&2; return 1
 	fi
+	reload_firewall_for_path || return 1
 	# Network + private credentials are complete. Authentication failure retains them.
 	ROLLBACK=0
 	IP="$(wait_for_ip "$NEW_IFACE")"

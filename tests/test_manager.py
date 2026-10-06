@@ -146,6 +146,19 @@ def mock_command():
         else:
             output = ''.join(f'{byte:02x}:' for byte in sys.stdin.buffer.read())
     elif name == 'firewall':
+        result = state.get('firewall_reload_status', 0)
+        change = True
+    elif name == 'fw4':
+        if args != ['-q', 'check']: raise AssertionError(args)
+        result = 1 if state.get('firewall_validation_failure') else 0
+        change = True
+    elif name == 'nft':
+        if args[:4] != ['list', 'chain', 'inet', 'fw4']: raise AssertionError(args)
+        devices = [value for key, value in state['config'].items() if key.endswith('dev.name')]
+        if state.get('missing_live_path_rules') or (args[4] == 'srcnat' and state.get('missing_live_path_nat')):
+            devices = [device for device in devices if device in ('macwan2', 'macwan3')]
+        output = 'oifname { ' + ', '.join('"' + device + '"' for device in devices) + ' } '
+        output += 'accept' if args[4] == 'accept_to_wan' else 'jump srcnat_wan'
         change = True
     else:
         raise AssertionError(name)
@@ -217,7 +230,7 @@ class EditTests(unittest.TestCase):
             file.write(source)
         bindir = self.root / 'bin'
         bindir.mkdir()
-        for name in ('uci', 'ubus', 'jsonfilter', 'ifdown', 'ifup', 'network', 'update', 'sleep', 'auth', 'id', 'stat', 'dd', 'hexdump', 'firewall'):
+        for name in ('uci', 'ubus', 'jsonfilter', 'ifdown', 'ifup', 'network', 'update', 'sleep', 'auth', 'id', 'stat', 'dd', 'hexdump', 'firewall', 'fw4', 'nft'):
             file = bindir / name
             with file.open('w', newline='\n') as command_file:
                 command_file.write(f'#!/bin/sh\nexec "$EDIT_MOCK_PYTHON" "$EDIT_MOCK_DISPATCH" --mock {name} "$@"\n')

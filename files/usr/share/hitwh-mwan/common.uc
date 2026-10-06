@@ -101,6 +101,7 @@ export function summarize(action, code, output) {
         if (match(line, /^Created /)) result.retained = true;
         if (match(line, /another WAN management operation/)) result.message = '另一项线路操作正在进行，请稍后重试';
         if (match(line, /no free WAN slot|maximum.*paths.*reached/)) result.message = '线路数量已达到上限';
+        if (match(line, /^Error: new WAN firewall/)) result.message = '新线路的防火墙规则未成功加载，已撤销本次新增';
     }
     return result;
 };
