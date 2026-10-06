@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
+import shlex
 import subprocess
 import threading
 import time
@@ -25,6 +27,19 @@ from typing import Any, Iterable
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+REFRESH_TIMEOUT = 300
+AUTH_MESSAGES = {
+    "missing_credentials": "未配置凭据", "no_dhcp": "尚未获得 DHCP 地址",
+    "mac_mismatch": "MAC 已变更，请重新保存凭据", "insecure_storage": "凭据文件权限不安全",
+    "captcha_required": "需要验证码，请手动登录", "encryption_required": "门户要求密码加密，请手动登录",
+    "service_required": "门户要求选择服务，请手动登录", "network_error": "网络请求失败",
+    "portal_not_detected": "未发现可信认证门户", "authentication_failed": "认证失败，请检查凭据",
+    "verification_failed": "登录后外网检查仍未通过", "address_changed": "地址已改变，请重新刷新",
+    "helper_unavailable": "请升级路由器认证组件", "invalid_credentials": "账号或密码无效",
+    "invalid_interface": "不是受管 WAN", "root_required": "需要 root 权限",
+    "storage_failed": "凭据存储失败", "mac_unavailable": "无法读取线路 MAC",
+    "invalid_response": "门户响应无效", "invalid_portal": "门户配置无效",
+}
 
 RECONNECT_SCRIPT = r'''#!/bin/sh
 if command -v hitwh-mwan >/dev/null 2>&1; then
@@ -125,8 +140,12 @@ while :; do
 	if [ -n "$STATUS" ]; then
 		while IFS= read -r LINE; do
 			case "$LINE" in
-				wan\ *) printf 'PATH\t%s\n' "$LINE" ;;
-				wan[0-9]*\ *) printf 'PATH\t%s\n' "$LINE" ;;
+				wan\ *|wan[0-9]*\ *)
+					printf 'PATH\t%s\n' "$LINE"
+					IFACE="${LINE%% *}"
+					SAVED=0
+					[ ! -L "/etc/hitwh-mwan/auth.d/$IFACE.json" ] && [ -f "/etc/hitwh-mwan/auth.d/$IFACE.json" ] && SAVED=1
+					printf 'AUTHCFG\t%s\t%s\n' "$IFACE" "$SAVED" ;;
 			esac
 		done <"$STATUS"
 
@@ -198,6 +217,8 @@ def parse_frame(lines: Iterable[str]) -> dict[str, Any]:
                     "rx_bytes": int(parts[3]),
                     "tx_bytes": int(parts[4]),
                 }
+            elif kind == "AUTHCFG" and len(parts) >= 3:
+                result["paths"].setdefault(parts[1], {"interface": parts[1]})["credentials_saved"] = parts[2] == "1"
         except (TypeError, ValueError):
             continue
     return result
@@ -274,6 +295,7 @@ class RateCalculator:
                     "ip": info.get("ip", "—"),
                     "state": info.get("state", "unknown"),
                     "mark": info.get("mark", "—"),
+                    "credentials_saved": bool(info.get("credentials_saved", False)),
                     "rx_bytes_per_second": round(delta["rx"] / dt, 1) if dt else 0.0,
                     "tx_bytes_per_second": round(delta["tx"] / dt, 1) if dt else 0.0,
                     "rx_bytes_since_view": total["rx"],
@@ -371,15 +393,20 @@ class RouterCollector:
     def _ssh_command(self) -> list[str]:
         return [*self._ssh_base_command(), self.target, f"sh -s -- {self.interval:g}"]
 
-    def reconnect_paths(self) -> tuple[bool, str]:
+    def reconnect_paths(self, interface: str = "") -> tuple[bool, str]:
+        if interface:
+            if not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", interface):
+                return False, "无效线路"
+            result = self.router_action({"action": "refresh", "interface": interface})
+            return bool(result.get("ok")), result.get("message", "刷新完成")
         if not self.reconnect_lock.acquire(blocking=False):
-            return False, "线路重连正在进行"
+            return False, "线路刷新正在进行"
         try:
             result = subprocess.run(
                 [*self._ssh_base_command(), self.target, "sh -s"],
                 input=RECONNECT_SCRIPT.encode("utf-8"),
                 capture_output=True,
-                timeout=75,
+                timeout=REFRESH_TIMEOUT,
             )
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
@@ -397,18 +424,92 @@ class RouterCollector:
                     self.touch()
                     return True, f"已恢复 {recovered} 条线路"
                 self.touch()
-                return False, f"已恢复 {recovered}/{attempted} 条；其余线路可能需要重新认证"
+                reasons = []
+                for line in stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) == 3 and parts[0] == "AUTH_RESULT" and parts[2] in AUTH_MESSAGES:
+                        if re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", parts[1]):
+                            reasons.append(f"{parts[1]}：{AUTH_MESSAGES[parts[2]]}")
+                detail = "；".join(reasons) or "其余线路可能需要重新认证"
+                return False, f"已恢复 {recovered}/{attempted} 条；{detail}"
             if result.returncode == 0:
                 self.touch()
-                return True, "线路重连完成"
-            detail = (stderr or stdout).strip()
-            return False, detail or f"远程命令退出状态 {result.returncode}"
+                return True, "线路刷新完成"
+            return False, f"刷新失败（远程状态 {result.returncode}）"
         except subprocess.TimeoutExpired:
-            return False, "线路重连超时"
+            return False, "线路刷新超时"
         except OSError as exc:
             return False, str(exc)
         finally:
             self.reconnect_lock.release()
+
+    def native_rpc(self, method: str, values: dict[str, Any]) -> dict[str, Any]:
+        if method not in {"snapshot", "settings", "start", "job"}:
+            return {"ok": False, "message": "无效操作"}
+        code = ("import { stdin } from 'fs'; import { connect } from 'ubus'; "
+                f"print(sprintf('%J',connect().call('hitwh.mwan','{method}',json(stdin.read('all'))))); ")
+        try:
+            result = subprocess.run([*self._ssh_base_command(), self.target, "ucode -e " + shlex.quote(code)],
+                input=json.dumps(values, ensure_ascii=False).encode(), capture_output=True, timeout=20)
+            if result.returncode:
+                return {"ok": False, "message": "请在路由器安装新版 IPK 并检查 SSH 连接"}
+            data = json.loads(result.stdout)
+            return data if isinstance(data, dict) else {"ok": False, "message": "路由器响应无效"}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return {"ok": False, "message": "路由器接口不可用，请检查组件版本和连接"}
+
+    def router_action(self, values: dict[str, Any]) -> dict[str, Any]:
+        result = self.native_rpc("start", values)
+        if not result.get("ok"):
+            return result
+        job_id = result["job"]
+        deadline = time.monotonic() + 320
+        while time.monotonic() < deadline:
+            time.sleep(0.7)
+            result = self.native_rpc("job", {"id": job_id})
+            if result.get("state") == "done" or not result.get("ok"):
+                break
+        else:
+            return {"ok": False, "message": "操作超时，请检查线路状态"}
+        self.touch()
+        details = [f"{d['interface']}：{AUTH_MESSAGES[d['code']]}" for d in result.get("details", [])
+                   if d.get("code") in AUTH_MESSAGES and re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", d.get("interface", ""))]
+        if details: result["message"] = "；".join(details)
+        return result
+
+    def credentials(self, action: str, interface: str, values: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """Only explicit dialog actions read secrets; no collector state caches them."""
+        if action not in {"get", "save", "remove"} or not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", interface):
+            return False, {"message": "无效的凭据操作或接口"}
+        payload = None
+        if action == "save":
+            username, password = values.get("username"), values.get("password")
+            if (not isinstance(username, str) or not isinstance(password, str) or not username or not password
+                    or len(username.encode("utf-8")) > 1024 or len(password.encode("utf-8")) > 2048
+                    or any(ord(char) < 32 or ord(char) == 127 for char in username + password)):
+                return False, {"message": "请输入有效账号和密码"}
+            payload = json.dumps({"username": username, "password": password}, ensure_ascii=False).encode("utf-8")
+        command_action = "import" if action == "save" else action
+        # interface is a validated identifier; credentials travel over stdin.
+        command = [*self._ssh_base_command(), self.target, f"hitwh-mwan auth {command_action} {interface}"]
+        try:
+            result = subprocess.run(command, input=payload, capture_output=True, timeout=20)
+            if result.returncode:
+                parts = result.stdout.decode("utf-8", errors="replace").strip().split()
+                reason = parts[2] if len(parts) == 3 and parts[0] == "AUTH_RESULT" else "helper_unavailable"
+                return False, {"message": AUTH_MESSAGES.get(reason, "凭据操作失败")}
+            if action == "get":
+                data = json.loads(result.stdout)
+                username, password = data.get("username"), data.get("password")
+                if isinstance(username, str) and isinstance(password, str):
+                    return True, {"configured": True, "username": username, "password": password, "mac": data.get("mac", "")}
+                if data.get("configured") is False:
+                    return True, {"configured": False, "username": "", "password": ""}
+                return False, {"message": "凭据文件格式无效"}
+            return True, {"configured": action == "save", "message": "凭据已保存" if action == "save" else "凭据已删除"}
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, AttributeError):
+            # Exceptions and remote stderr may include payloads: never echo them.
+            return False, {"message": "无法访问路由器凭据，请检查 SSH 连接及组件版本"}
 
     def _run(self) -> None:
         while True:
@@ -494,7 +595,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._local_request():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         if self.path == "/api/snapshot":
+            native = self.collector.native_rpc("snapshot", {})
+            if "raw" in native:
+                self._json_response(native, HTTPStatus.OK)
+                return
             self.collector.touch()
             body = json.dumps(self.collector.snapshot(), ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -512,9 +620,50 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/api/config":
+            result = self.collector.native_rpc("settings", {})
+            self._json_response(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT)
+            return
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._local_request():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        if self.path in {"/api/paths", "/api/config"}:
+            if self.headers.get("X-Dashboard-Action") != "manage-paths" or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 8192: raise ValueError
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict): raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid request")
+                return
+            if self.path == "/api/config": data["action"] = "configure"
+            result = self.collector.router_action(data)
+            self._json_response(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT)
+            return
+        if self.path == "/api/credentials":
+            if (self.headers.get("X-Dashboard-Action") != "credentials"
+                    or self.headers.get("Content-Type", "").split(";")[0] != "application/json"):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 8192:
+                    raise ValueError
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict) or not isinstance(data.get("interface"), str) or not isinstance(data.get("action"), str):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid request")
+                return
+            ok, result = self.collector.credentials(data["action"], data["interface"], data)
+            self._json_response({"ok": ok, **result}, HTTPStatus.OK if ok else HTTPStatus.CONFLICT)
+            return
         if self.path == "/api/pause":
             self.collector.stop()
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -525,7 +674,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if self.headers.get("X-Dashboard-Action") != "reconnect-paths":
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
-            ok, message = self.collector.reconnect_paths()
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 8192 or length < 0: raise ValueError
+                data = json.loads(self.rfile.read(length)) if length else {}
+                if not isinstance(data, dict) or not isinstance(data.get("interface", ""), str): raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid request")
+                return
+            ok, message = self.collector.reconnect_paths(data.get("interface", ""))
             body = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK if ok else HTTPStatus.CONFLICT)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -540,6 +697,30 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/"):
             return
         super().log_message(fmt, *args)
+
+    def _local_request(self) -> bool:
+        port = self.server.server_port
+        host = self.headers.get("Host", "")
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            allowed.update({"127.0.0.1", "localhost"})
+        # Reject DNS rebinding as well as cross-origin credential requests.
+        return host in allowed and self.headers.get("Origin", f"http://{host}") == f"http://{host}"
+
+    def _json_response(self, value: dict[str, Any], status: HTTPStatus) -> None:
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'")
+        super().end_headers()
 
 
 def build_parser() -> argparse.ArgumentParser:

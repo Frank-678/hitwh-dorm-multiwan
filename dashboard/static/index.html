@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>多路负载监控</title>
+  <title>多路合并管理器</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <div class="title-row">
-        <h1>多路负载监控</h1>
+        <h1>多路合并管理器</h1>
         <span id="connection-pill" class="status-pill" data-state="connecting">正在连接</span>
       </div>
       <div class="top-actions">
@@ -20,8 +20,9 @@
           <span id="updated-at" class="updated-at">等待首个样本</span>
           <span id="refresh-status" class="refresh-status" role="status" aria-live="polite"></span>
         </div>
-        <button id="reconnect-button" type="button">重连离线线路</button>
-        <button id="pause-button" type="button">暂停</button>
+        <button id="settings-button" type="button">接入设置</button>
+        <button id="reconnect-button" type="button">刷新离线线路</button>
+        <button id="add-button" class="primary-button" type="button">新增线路</button>
       </div>
     </header>
 
@@ -40,6 +41,11 @@
         <span class="metric-label">CPU</span>
         <strong id="cpu-usage">0%</strong>
         <span id="load-average" class="metric-note">负载 0.00</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">内存</span>
+        <strong id="memory-usage">0%</strong>
+        <span class="metric-note">系统内存占用</span>
       </article>
       <article class="metric">
         <span class="metric-label">连接跟踪</span>
@@ -67,15 +73,73 @@
       <div id="path-list" class="path-list" aria-live="polite"></div>
     </section>
 
-    <section class="system-row" aria-label="路由器状态">
-      <div><span>内存</span><strong id="memory-usage">0%</strong></div>
-      <div><span>运行时间</span><strong id="uptime">—</strong></div>
-      <div><span>采集方式</span><strong>单 SSH 连接</strong></div>
-      <div><span>目标</span><strong id="router-target">—</strong></div>
-    </section>
-
     <div id="error-box" class="error-box" hidden></div>
   </main>
-  <script src="/app.js" defer></script>
+  <dialog id="credentials-dialog" aria-labelledby="credentials-title">
+    <form id="credentials-form" autocomplete="off">
+      <div class="dialog-heading">
+        <h2 id="credentials-title">线路凭据</h2>
+        <button id="credentials-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <p class="dialog-note">保存后点击该线路的“刷新”进行认证。掉线时不会自动登录。</p>
+      <label class="credential-field">账号
+        <input id="credential-username" name="username" required maxlength="256" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="credential-field">密码
+        <input id="credential-password" name="password" type="password" required maxlength="512" autocomplete="off">
+      </label>
+      <label class="password-visibility"><input id="credential-visible" type="checkbox">显示密码</label>
+      <p id="credentials-message" class="dialog-message" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button id="credentials-remove" type="button" hidden>删除凭据</button>
+        <button id="credentials-cancel" type="button">取消</button>
+        <button id="credentials-save" type="submit" class="primary-button">保存凭据</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="add-dialog" aria-labelledby="add-title">
+    <form id="add-form" autocomplete="off">
+      <div class="dialog-heading"><h2 id="add-title">新增线路</h2><button type="button" data-close="add-dialog" aria-label="关闭">×</button></div>
+      <p class="dialog-note">每条线路使用独立 MAC 和 DHCP 会话。账号只用于本次新增线路。</p>
+      <fieldset class="mode-options"><legend>添加方式</legend>
+        <label><input name="mode" type="radio" value="random" checked>随机生成 MAC 并认证</label>
+        <label><input name="mode" type="radio" value="mac">使用已认证的 MAC</label>
+      </fieldset>
+      <div id="add-mac-fields" hidden><label class="credential-field">已认证的 MAC<input id="add-mac" placeholder="02:xx:xx:xx:xx:xx" maxlength="17"></label></div>
+      <div id="add-credential-fields">
+        <label class="credential-field">账号<input id="add-username" required autocomplete="off" spellcheck="false"></label>
+        <label class="credential-field">密码<input id="add-password" type="password" required autocomplete="off"></label>
+        <label class="password-visibility"><input id="add-visible" type="checkbox">显示密码</label>
+      </div>
+      <p id="add-message" class="dialog-message" role="status"></p>
+      <div class="dialog-actions"><button type="button" data-close="add-dialog">取消</button><button id="add-submit" class="primary-button" type="submit">添加并认证</button></div>
+    </form>
+  </dialog>
+  <dialog id="path-dialog" aria-labelledby="path-action-title">
+    <form id="path-action-form">
+      <div class="dialog-heading"><h2 id="path-action-title">线路操作</h2><button type="button" data-close="path-dialog" aria-label="关闭">×</button></div>
+      <p id="path-action-note" class="dialog-note"></p>
+      <label id="edit-mac-field" class="credential-field" hidden>新 MAC<input id="edit-mac" maxlength="17"></label>
+      <p id="path-action-message" class="dialog-message" role="status"></p>
+      <div class="dialog-actions"><button type="button" data-close="path-dialog">取消</button><button id="path-action-submit" class="primary-button" type="submit">确认</button></div>
+    </form>
+  </dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <div class="dialog-heading"><h2 id="settings-title">校园网接入设置</h2><button type="button" data-close="settings-dialog" aria-label="关闭">×</button></div>
+      <p class="dialog-note">默认适用于 HITwh。其他学校请填写其锐捷 ePortal 地址；这里不填写账号密码。</p>
+      <label class="credential-field">WAN 父设备<input id="setting-parent" required placeholder="eth1"></label>
+      <label class="credential-field">LAN 网桥<input id="setting-lan" required placeholder="br-lan"></label>
+      <label class="credential-field">可信认证门户<input id="setting-portal" type="url" required placeholder="http://认证服务器/eportal"></label>
+      <button id="portal-discover" type="button">检测门户地址</button>
+      <label class="credential-field">204 健康检查地址<input id="setting-health" type="url" required></label>
+      <label class="credential-field">新连接分流方式<select id="setting-balance"><option value="round_robin">轮询（默认）</option><option value="random">随机</option></select></label>
+      <label class="password-visibility"><input id="setting-failover" type="checkbox" checked>路由器自身优先使用健康线路</label>
+      <p id="settings-message" class="dialog-message" role="status"></p>
+      <div class="dialog-actions"><button type="button" data-close="settings-dialog">取消</button><button id="settings-submit" class="primary-button" type="submit">保存设置</button></div>
+    </form>
+  </dialog>
+  <script src="transport.js" defer></script>
+  <script src="app.js" defer></script>
 </body>
 </html>

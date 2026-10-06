@@ -36,15 +36,23 @@ def mock_command():
     if name == 'uci':
         key = args[-1]
         values = {'hitwh_mwan.main.max_paths': '2', **state.get('config', {})}
-        if key.startswith('network.'):
-            result = 0 if key[8:] in state['paths'] else 1
+        if key in values:
+            output = values[key]
+            result = 0 if output else 1
+        elif key.startswith('network.'):
+            section, _, option = key[8:].partition('.')
+            iface = section.removesuffix('dev')
+            path = state['paths'].get(iface)
+            if not path: result = 1
+            elif not option: output = 'device' if section.endswith('dev') else 'interface'
+            else: output = {'type':'macvlan','ifname':'eth1','device':path['dev'],'proto':'dhcp'}.get(option,'')
         else:
             output = values.get(key, '')
             result = 0 if output else 1
     elif name == 'ubus':
         iface = args[1].split('.')[-1]
         path = state['paths'].get(iface)
-        output = json.dumps({'l3_device': path['dev'], 'ipv4-address': [{'address': path['ip']}], 'route': [{'nexthop': state['gateway']}], 'dns-server': path.get('dns', []), 'inactive': {'dns-server': path.get('inactive_dns', [])}}) if path else '{}'
+        output = json.dumps({'l3_device': path['dev'], 'ipv4-address': [{'address': path['ip'], 'mask': path.get('mask',16)}], 'route': [{'nexthop': path.get('gateway',state['gateway'])}], 'dns-server': path.get('dns', []), 'inactive': {'dns-server': path.get('inactive_dns', [])}}) if path else '{}'
     elif name == 'jsonfilter':
         data = json.load(sys.stdin)
         rows = []
@@ -52,7 +60,7 @@ def mock_command():
             if arg != '-e': continue
             expression = args[index + 1]
             if expression == '@.l3_device': rows.append(data.get('l3_device', ''))
-            elif 'ipv4-address' in expression: rows.append(data.get('ipv4-address', [{}])[0].get('address', ''))
+            elif 'ipv4-address' in expression: rows.append(str(data.get('ipv4-address', [{}])[0].get('mask' if '.mask' in expression else 'address', '')))
             elif expression == '@.route[0].nexthop': rows.append(data.get('route', [{}])[0].get('nexthop', ''))
             elif expression == '@["dns-server"][*]': rows.extend(data.get('dns-server', []))
             elif expression == '@.inactive["dns-server"][*]': rows.extend(data.get('inactive', {}).get('dns-server', []))
@@ -113,7 +121,7 @@ def mock_command():
                 row = {'table': table, 'prefix': prefix, 'guard': 'unreachable' in rest}
                 for field in ('via', 'dev', 'src', 'metric'):
                     if field in rest: row[field] = rest[rest.index(field) + 1]
-                state['routes'] = [r for r in state['routes'] if (r['table'], r['prefix'], r.get('metric')) != (table, prefix, row.get('metric'))]
+                state['routes'] = [r for r in state['routes'] if (r['table'], r['prefix'], r.get('metric') or '0') != (table, prefix, row.get('metric') or '0')]
                 state['routes'].append(row)
             else:
                 raise AssertionError(f'Unexpected destructive route command: {args}')
@@ -172,6 +180,28 @@ class UpdateTests(unittest.TestCase):
         self.clear_changes()
         self.run_update()
         self.assertEqual(self.state['changes'], [])
+
+    def test_other_school_dhcp_prefix_and_gateway_are_used(self):
+        self.state['paths']['wan2'].update(ip='192.168.44.27',mask=24,gateway='192.168.44.1'); self.save()
+        self.run_update()
+        routes=[r for r in self.state['routes'] if r['table']==102]
+        self.assertTrue(any(r['prefix']=='192.168.44.0/24' for r in routes))
+        self.assertTrue(any(r.get('via')=='192.168.44.1' for r in routes))
+
+    def test_fresh_install_has_no_enrolled_paths_and_preserves_physical_interface(self):
+        self.state['paths'].pop('wan2')
+        self.state['config']={'hitwh_mwan.main.main_enrolled':'0'}; self.save()
+        self.run_update()
+        self.assertIn('active_count:0',(self.root/'hitwh-mwan.status').read_text())
+        self.assertFalse(any(c[0]=='curl' for c in self.state['changes']))
+
+    def test_disabling_main_withdraws_it_without_interrupting_virtual_path(self):
+        self.run_update()
+        self.state['config']={'hitwh_mwan.main.main_enrolled':'0'}; self.save()
+        self.clear_changes(); self.run_update()
+        self.assertIn('active_interfaces: wan2',(self.root/'hitwh-mwan.status').read_text())
+        self.assertFalse(any(r['table']==101 and r.get('via') for r in self.state['routes']))
+        self.assertTrue(any(r['table']==102 and r.get('via') for r in self.state['routes']))
 
     def test_address_change_replaces_only_its_path_and_adds_rule_first(self):
         self.run_update()

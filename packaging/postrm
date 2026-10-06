@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+/etc/init.d/rpcd restart
+echo 'Network identities, private credentials and MAC history kept. Delete unwanted paths explicitly before uninstalling.'

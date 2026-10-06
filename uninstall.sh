@@ -2,6 +2,13 @@
 
 set -eu
 
+REMOVE_CREDENTIALS=0
+case "${1:-}" in
+	'') ;;
+	--remove-credentials) REMOVE_CREDENTIALS=1 ;;
+	*) echo 'Usage: uninstall.sh [--remove-credentials]' >&2; exit 2 ;;
+esac
+
 [ "$(id -u)" -eq 0 ] || {
 	echo "Error: run this script as root on OpenWrt." >&2
 	exit 1
@@ -45,6 +52,7 @@ done
 
 N=2
 while [ "$N" -le "$MAX_PATHS" ]; do
+	if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
 	DSEC="wan${N}dev"
 	IFACE="wan$N"
 	TYPE="$(uci -q get "network.$DSEC.type" || true)"
@@ -67,6 +75,7 @@ uci commit firewall
 nft delete table inet hitwh_mwan >/dev/null 2>&1 || true
 rm -f \
 	/usr/sbin/hitwh-mwan \
+	/usr/sbin/hitwh-mwan-auth \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \
 	/etc/init.d/hitwh-mwan \
@@ -78,6 +87,7 @@ rm -f \
 for PATH_TO_REMOVE in \
 	/etc/init.d/hitwh-mwan-dns \
 	/usr/sbin/hitwh-mwan \
+	/usr/sbin/hitwh-mwan-auth \
 	/usr/sbin/hitwh-mwan-update \
 	/usr/sbin/hitwh-mwan-monitor \
 	/usr/share/nftables.d/ruleset-post/90-hitwh-mwan.nft; do
@@ -88,3 +98,11 @@ done
 /etc/init.d/firewall reload >/dev/null 2>&1 || true
 
 echo "Uninstalled. Configuration backup: $BACKUP_DIR"
+if [ "$REMOVE_CREDENTIALS" = 1 ]; then
+	[ ! -L /etc/hitwh-mwan ] && [ ! -L /etc/hitwh-mwan/auth.d ] || {
+		echo 'Refusing to remove a symlinked credential directory.' >&2; exit 1;
+	}
+	rm -rf /etc/hitwh-mwan/auth.d
+else
+	echo 'Local credentials kept in /etc/hitwh-mwan/auth.d. Use --remove-credentials to delete them.'
+fi

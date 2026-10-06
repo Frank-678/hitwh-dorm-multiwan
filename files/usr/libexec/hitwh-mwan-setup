@@ -1,0 +1,55 @@
+#!/bin/sh
+# Package setup; never creates paths or submits authentication.
+set -eu
+umask 077
+[ "$(id -u)" = 0 ] || exit 1
+for CMD in uci ubus jsonfilter nft ip curl fw4 stat hexdump flock ucode; do
+    command -v "$CMD" >/dev/null 2>&1 || { echo "Missing required runtime: $CMD" >&2; exit 1; }
+done
+[ ! -L /etc/hitwh-mwan ] && [ ! -L /etc/hitwh-mwan/auth.d ] || exit 1
+mkdir -p /etc/hitwh-mwan/auth.d
+chown root:root /etc/hitwh-mwan /etc/hitwh-mwan/auth.d
+chmod 700 /etc/hitwh-mwan /etc/hitwh-mwan/auth.d
+modprobe macvlan >/dev/null 2>&1 || true
+[ -d /sys/module/macvlan ] || { echo 'Load the firmware-matched kmod-macvlan first.' >&2; exit 1; }
+
+if [ "$(uci -q get 'dhcp.@dnsmasq[0]' || true)" = dnsmasq ]; then
+    SERVERS="$(uci -q get 'dhcp.@dnsmasq[0].serversfile' || true)"
+    if [ -z "$SERVERS" ] || [ "$SERVERS" = /var/run/hitwh-mwan.dns ]; then
+        touch /var/run/hitwh-mwan.dns
+        chmod 644 /var/run/hitwh-mwan.dns
+        uci set 'dhcp.@dnsmasq[0].serversfile=/var/run/hitwh-mwan.dns'
+        uci commit dhcp
+        /etc/init.d/hitwh-mwan-dns enable
+        /etc/init.d/dnsmasq reload
+    fi
+fi
+FLOW="$(uci -q get 'firewall.@defaults[0].flow_offloading' || true)"
+FLOW_HW="$(uci -q get 'firewall.@defaults[0].flow_offloading_hw' || true)"
+if [ -z "$(uci -q get hitwh_mwan.main.previous_flow_offloading || true)" ]; then
+    uci set "hitwh_mwan.main.previous_flow_offloading=${FLOW:-0}"
+    uci set "hitwh_mwan.main.previous_flow_offloading_hw=${FLOW_HW:-0}"
+    uci commit hitwh_mwan
+fi
+uci set firewall.@defaults[0].flow_offloading=0
+uci set firewall.@defaults[0].flow_offloading_hw=0
+uci commit firewall
+/etc/init.d/hitwh-mwan enable
+/etc/init.d/hitwh-mwan stop
+WAIT=0
+while [ -d /var/run/hitwh-mwan-update.lock ] && [ "$WAIT" -lt 15 ]; do sleep 1; WAIT=$((WAIT + 1)); done
+fw4 check
+if ! /etc/init.d/firewall reload; then
+    # Kwrt's fw4 wrapper returns its optional trailing include's status.
+    # Accept that quirk only after checking the live firewall and offload state.
+    nft list table inet fw4 >/dev/null || exit 1
+    LIVE_FORWARD="$(nft list chain inet fw4 forward)" || exit 1
+    printf '%s\n' "$LIVE_FORWARD" | grep -q 'flow add' && exit 1
+    echo 'Firewall reload returned a vendor-hook status; live rules and disabled offload verified.' >&2
+fi
+/usr/sbin/hitwh-mwan-update
+/etc/init.d/hitwh-mwan start
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+/etc/init.d/rpcd restart
+echo 'Installed. Open LuCI: Network -> 多路合并管理器. No authentication was submitted.'

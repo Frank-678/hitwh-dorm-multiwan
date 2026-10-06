@@ -1,0 +1,63 @@
+#!/bin/sh
+set +x
+set +a
+umask 077
+DIR="$1"
+case "$DIR" in /tmp/hitwh-mwan-job.*) ;; *) exit 2 ;; esac
+ID="${DIR#/tmp/hitwh-mwan-job.}"
+[ "${#ID}" -eq 6 ] || exit 2
+case "$ID" in *[!a-zA-Z0-9]*) exit 2 ;; esac
+[ ! -L "$DIR" ] && [ -d "$DIR" ] && [ "$(stat -c '%u:%a' "$DIR")" = 0:700 ] || exit 2
+[ ! -L "$DIR/request.json" ] && [ -f "$DIR/request.json" ] &&
+    [ "$(stat -c '%u:%a' "$DIR/request.json")" = 0:600 ] || exit 2
+CHILD=""
+TIMER=""
+cleanup() {
+    [ -z "$CHILD" ] || kill "$CHILD" 2>/dev/null || true
+    [ -z "$TIMER" ] || kill "$TIMER" 2>/dev/null || true
+    rm -f "$DIR/request.json"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM HUP
+trap 'exit 130' INT
+ACTION="$(jsonfilter -i "$DIR/request.json" -e '@.action' 2>/dev/null)"
+IFACE="$(jsonfilter -i "$DIR/request.json" -e '@.interface' 2>/dev/null)"
+MAC="$(jsonfilter -i "$DIR/request.json" -e '@.mac' 2>/dev/null)"
+case "$IFACE" in *[!a-zA-Z0-9_-]*) exit 2 ;; esac
+case "$MAC" in *[!a-fA-F0-9:]*) exit 2 ;; esac
+exec 3<"$DIR/request.json"
+rm -f "$DIR/request.json"
+case "$ACTION" in
+    add-random) set -- /usr/sbin/hitwh-mwan add random --stdin ;;
+    add-mac) set -- /usr/sbin/hitwh-mwan add "$MAC" ;;
+    refresh) set -- /usr/sbin/hitwh-mwan refresh; [ -z "$IFACE" ] || set -- "$@" "$IFACE" ;;
+    remove) set -- /usr/sbin/hitwh-mwan remove "$IFACE" ;;
+    edit) set -- /usr/sbin/hitwh-mwan edit "$IFACE" "$MAC" ;;
+    credentials-save) set -- /usr/sbin/hitwh-mwan auth import "$IFACE" ;;
+    credentials-remove) set -- /usr/sbin/hitwh-mwan auth remove "$IFACE" ;;
+    configure) set -- /usr/bin/ucode /usr/share/hitwh-mwan/configure.uc ;;
+    discover) set -- /usr/sbin/hitwh-mwan portal "$IFACE" ;;
+    *) exit 2 ;;
+esac
+"$@" <&3 >"$DIR/output" 2>&1 &
+CHILD=$!
+echo "$CHILD" >"$DIR/pid"
+exec 3<&-
+MANAGER=$$
+(
+    SLEEP_PID=""
+    trap '[ -z "$SLEEP_PID" ] || kill "$SLEEP_PID" 2>/dev/null || true' EXIT
+    trap 'exit 0' TERM INT HUP
+    sleep 300 & SLEEP_PID=$!
+    wait "$SLEEP_PID" || exit 0
+    kill -TERM "$CHILD" 2>/dev/null || true
+) &
+TIMER=$!
+wait "$CHILD"; CODE=$?
+CHILD=""
+kill "$TIMER" 2>/dev/null || true
+wait "$TIMER" 2>/dev/null || true
+TIMER=""
+if [ "$ACTION" = configure ] && [ "$CODE" = 0 ]; then /usr/sbin/hitwh-mwan-update >/dev/null 2>&1 || CODE=1; fi
+ucode /usr/share/hitwh-mwan/job-result.uc "$DIR" "$ACTION" "$CODE"
+rm -f "$DIR/output" "$DIR/pid"

@@ -12,10 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Validate scripts and project files
         run: make check
+      - name: Build offline OpenWrt IPK
+        run: make ipk
+      - name: Check Git history and release payload for credential artifacts
+        run: python3 tests/check_secrets.py --history --ipk dist/*.ipk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-24.10-ipk
+          path: dist/
 
   dashboard:
     name: Dashboard (${{ matrix.os }}, Python ${{ matrix.python }})

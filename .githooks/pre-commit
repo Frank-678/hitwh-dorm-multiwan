@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if command -v python3 >/dev/null 2>&1; then
+	exec python3 tests/check_secrets.py --staged
+fi
+exec python tests/check_secrets.py --staged

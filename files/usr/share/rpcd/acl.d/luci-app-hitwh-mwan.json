@@ -1,0 +1,7 @@
+{
+  "luci-app-hitwh-mwan": {
+    "description": "Manage multi-WAN paths and their private authentication credentials",
+    "read": { "ubus": { "hitwh.mwan": [ "snapshot", "settings", "job" ] } },
+    "write": { "ubus": { "hitwh.mwan": [ "credentials", "start" ] } }
+  }
+}

@@ -1,15 +1,81 @@
 #!/bin/sh
 
+set +x
+set +a
+umask 077
 MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
 PARENT_DEVICE="$(uci -q get hitwh_mwan.main.parent_device)"
 MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
+MAIN_ENROLLED="$(uci -q get hitwh_mwan.main.main_enrolled)"
 LOCK=/var/run/hitwh-mwan-update.lock
 UPDATE_COMMAND="${HITWH_MWAN_UPDATE:-/usr/sbin/hitwh-mwan-update}"
 STATUS_FILE="${HITWH_MWAN_STATUS:-/tmp/hitwh-mwan.status}"
+AUTH_COMMAND="${HITWH_MWAN_AUTH:-/usr/sbin/hitwh-mwan-auth}"
+MANAGEMENT_LOCK="${HITWH_MWAN_MANAGEMENT_LOCK:-${HITWH_MWAN_REFRESH_LOCK:-/var/run/hitwh-mwan-management.lock}}"
+AUTH_DIR="${HITWH_MWAN_AUTH_DIR:-/etc/hitwh-mwan/auth.d}"
+AUTH_BASE="$(dirname "$AUTH_DIR")"
+HISTORY="$AUTH_BASE/mac-history"
+PENDING_DIR=""
+HISTORY_TEMP=""
+AUTH_PIDS=""
+WATCHDOG_PID=""
+ROLLBACK=0
+
+rollback_random() {
+	# These names were verified unused while holding the management lock.
+	"$AUTH_COMMAND" remove "$NEW_IFACE" >/dev/null 2>&1 || true
+	ifdown "$NEW_IFACE" >/dev/null 2>&1 || true
+	uci -q delete "network.$NEW_IFACE" || true
+	uci -q delete "network.$NEW_DSEC" || true
+	uci -q del_list "$ZONE.network=$NEW_IFACE" || true
+	uci commit network && uci commit firewall || echo 'Error: rollback could not be saved.' >&2
+	/etc/init.d/network reload >/dev/null 2>&1 || true
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	run_update >/dev/null 2>&1 || true
+}
+cleanup_manager() {
+	for AUTH_PID in $AUTH_PIDS; do kill "$AUTH_PID" 2>/dev/null || true; done
+	[ -z "$WATCHDOG_PID" ] || kill "$WATCHDOG_PID" 2>/dev/null || true
+	for AUTH_PID in $AUTH_PIDS; do wait "$AUTH_PID" 2>/dev/null || true; done
+	[ -z "$WATCHDOG_PID" ] || wait "$WATCHDOG_PID" 2>/dev/null || true
+	[ "$ROLLBACK" = 0 ] || rollback_random
+	[ -z "$PENDING_DIR" ] || rm -rf "$PENDING_DIR"
+	[ -z "$HISTORY_TEMP" ] || rm -f "$HISTORY_TEMP"
+}
+trap cleanup_manager EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+acquire_management_lock() {
+	command -v flock >/dev/null 2>&1 || { echo 'Error: flock is required.' >&2; return 1; }
+	[ ! -L "$MANAGEMENT_LOCK" ] || return 1
+	exec 9>"$MANAGEMENT_LOCK" || return 1
+	flock -n 9 || { echo 'Error: another WAN management operation is in progress.' >&2; return 1; }
+}
+
+start_refresh_budget() {
+	MANAGER_PID=$$
+	(
+		TIMER_SLEEP=""
+		trap '[ -z "$TIMER_SLEEP" ] || kill "$TIMER_SLEEP" 2>/dev/null || true' EXIT
+		trap 'exit 0' TERM INT HUP
+		sleep 270 & TIMER_SLEEP=$!
+		wait "$TIMER_SLEEP" || exit 0
+		echo 'Error: manual refresh time budget exhausted.' >&2
+		kill -TERM "$MANAGER_PID"
+	) &
+	WATCHDOG_PID=$!
+}
+
+wait_auth_batch() {
+	for AUTH_PID in $AUTH_PIDS; do wait "$AUTH_PID" || true; done
+	AUTH_PIDS=""
+}
 
 [ -n "$MAX_PATHS" ] || MAX_PATHS=17
 [ -n "$PARENT_DEVICE" ] || PARENT_DEVICE=eth1
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
+[ -n "$MAIN_ENROLLED" ] || MAIN_ENROLLED=1
 
 usage() {
 	cat <<'EOF'
@@ -18,10 +84,15 @@ HITwh dorm multi-WAN manager
 Usage:
   hitwh-mwan set-main AA:BB:CC:DD:EE:FF
   hitwh-mwan add AA:BB:CC:DD:EE:FF
+  hitwh-mwan add random [--stdin]
   hitwh-mwan edit <wan|wanN|number|old-MAC> AA:BB:CC:DD:EE:FF
-  hitwh-mwan remove <number|wanN|MAC>
+  hitwh-mwan remove <wan|number|wanN|MAC>
   hitwh-mwan list
-  hitwh-mwan refresh
+  hitwh-mwan refresh [wan|wanN]
+  hitwh-mwan portal [wan|wanN]
+  hitwh-mwan auth set <wan|wanN>
+  hitwh-mwan auth status [wan|wanN]
+  hitwh-mwan auth remove <wan|wanN>
   hitwh-mwan speed [seconds]
 EOF
 }
@@ -46,6 +117,7 @@ wait_for_updater() {
 
 run_update() {
 	wait_for_updater
+	[ ! -d "$LOCK" ] || { echo 'Error: the WAN updater is busy; retry shortly.' >&2; return 1; }
 	"$UPDATE_COMMAND"
 }
 
@@ -61,11 +133,166 @@ valid_mac() {
 	[ $((0x$FIRST & 1)) -eq 0 ]
 }
 
+find_free_slot() {
+	N=2
+	while [ "$N" -le "$MAX_PATHS" ]; do
+		if [ "$N" -ne 6 ] &&
+			! uci -q get "network.wan$N" >/dev/null &&
+			! uci -q get "network.wan${N}dev" >/dev/null &&
+			[ ! -e "/sys/class/net/macwan$N" ] &&
+			[ ! -e "$AUTH_DIR/wan$N.json" ] && [ ! -L "$AUTH_DIR/wan$N.json" ] &&
+			! find_device_section "macwan$N" >/dev/null; then
+			echo "$N"; return 0
+		fi
+		N=$((N + 1))
+	done
+	return 1
+}
+
+history_storage() {
+	[ "$(id -u)" = 0 ] || { echo 'Error: root is required.' >&2; return 1; }
+	[ ! -L "$AUTH_BASE" ] && [ ! -L "$AUTH_DIR" ] && [ ! -L "$HISTORY" ] || return 1
+	[ -e "$AUTH_BASE" ] || mkdir -m 700 "$AUTH_BASE" || return 1
+	[ "$(stat -c '%u:%a' "$AUTH_BASE")" = 0:700 ] && [ -d "$AUTH_BASE" ] || return 1
+	if [ -e "$AUTH_DIR" ]; then
+		[ -d "$AUTH_DIR" ] && [ "$(stat -c '%u:%a' "$AUTH_DIR")" = 0:700 ] || return 1
+	fi
+	if [ -e "$HISTORY" ]; then
+		[ -f "$HISTORY" ] && [ "$(stat -c '%u:%a' "$HISTORY")" = 0:600 ] || return 1
+		LC_ALL=C grep -qvE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' "$HISTORY" && return 1
+	fi
+	return 0
+}
+
+known_macs() {
+	# Read only MAC fields into the history, never copy credential/config data.
+	uci show network | sed -n "s/^[^=]*\.macaddr=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p"
+	for ADDRESS in /sys/class/net/*/address; do cat "$ADDRESS" 2>/dev/null; done
+	for RECORD in "$AUTH_DIR"/*.json; do
+		[ -f "$RECORD" ] || continue
+		jsonfilter -i "$RECORD" -e '@.mac' 2>/dev/null
+	done
+	if [ -d /root/hitwh-mwan-backups ]; then
+		find /root/hitwh-mwan-backups -type f -name 'network*' | while IFS= read -r BACKUP; do
+			awk '$1=="option" && $2=="macaddr" {gsub(/[\047\042]/,"",$3); print $3}' "$BACKUP"
+		done
+	fi
+}
+
+initialize_history() {
+	history_storage || { echo 'Error: MAC history storage is not private.' >&2; return 1; }
+	for RECORD in "$AUTH_DIR"/*.json; do
+		[ -e "$RECORD" ] || [ -L "$RECORD" ] || continue
+		[ ! -L "$RECORD" ] && [ -f "$RECORD" ] &&
+			[ "$(stat -c '%u:%a' "$RECORD")" = 0:600 ] || return 1
+		SAVED_MAC="$(jsonfilter -i "$RECORD" -e '@.mac' 2>/dev/null | tr 'A-F' 'a-f')"
+		printf '%s' "$SAVED_MAC" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || return 1
+	done
+	HISTORY_TEMP="$(mktemp "$AUTH_BASE/.history.XXXXXX")" || return 1
+	{
+		[ ! -e "$HISTORY" ] || cat "$HISTORY"
+		known_macs
+	} | tr 'A-F' 'a-f' | grep -E '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' | sort -u >"$HISTORY_TEMP" || return 1
+	chmod 600 "$HISTORY_TEMP" && mv -f "$HISTORY_TEMP" "$HISTORY" || return 1
+	HISTORY_TEMP=""
+}
+
+create_random_path() {
+	uci set "network.$NEW_DSEC=device" &&
+	uci set "network.$NEW_DSEC.name=$NEW_DEVICE" &&
+	uci set "network.$NEW_DSEC.type=macvlan" &&
+	uci set "network.$NEW_DSEC.ifname=$PARENT_DEVICE" &&
+	uci set "network.$NEW_DSEC.mode=bridge" &&
+	uci set "network.$NEW_DSEC.macaddr=$NEW_MAC" &&
+	uci set "network.$NEW_IFACE=interface" &&
+	uci set "network.$NEW_IFACE.device=$NEW_DEVICE" &&
+	uci set "network.$NEW_IFACE.proto=dhcp" &&
+	uci set "network.$NEW_IFACE.metric=$((NEW_SLOT * 10))" &&
+	uci set "network.$NEW_IFACE.defaultroute=0" &&
+	uci set "network.$NEW_IFACE.peerdns=0" &&
+	uci set "network.$NEW_IFACE.delegate=0" &&
+	uci add_list "$ZONE.network=$NEW_IFACE" &&
+	"$AUTH_COMMAND" import "$NEW_IFACE" <"$PENDING_DIR/value.json" &&
+	uci commit network && uci commit firewall &&
+	/etc/init.d/network reload && ifup "$NEW_IFACE" &&
+	/etc/init.d/firewall reload
+}
+
+cmd_add_random() {
+	# Fail before prompting when there is no capacity or required runtime.
+	find_free_slot >/dev/null || { echo 'Error: no free WAN slot.' >&2; return 4; }
+	for REQUIRED in flock stat hexdump uci ubus jsonfilter curl ifup ifdown; do
+		command -v "$REQUIRED" >/dev/null || { echo "Error: missing $REQUIRED." >&2; return 1; }
+	done
+	[ -r /dev/urandom ] && [ -x "$AUTH_COMMAND" ] && [ -x "$UPDATE_COMMAND" ] &&
+		[ -d /sys/module/macvlan ] && [ -d "/sys/class/net/$PARENT_DEVICE" ] &&
+		[ -x /etc/init.d/network ] && [ -x /etc/init.d/firewall ] || {
+		echo 'Error: random WAN runtime is unavailable.' >&2; return 1;
+	}
+	uci -q show network >/dev/null || { echo 'Error: cannot read network configuration.' >&2; return 1; }
+	ZONE="$(wan_zone)" || { echo 'Error: WAN firewall zone not found.' >&2; return 5; }
+	history_storage || { echo 'Error: private storage is unavailable.' >&2; return 1; }
+	PREPARE_ACTION=prepare
+	[ "${1:-}" != --stdin ] || PREPARE_ACTION=prepare-import
+	PENDING_DIR="$("$AUTH_COMMAND" "$PREPARE_ACTION")" || { PENDING_DIR=""; echo 'Error: credential input failed or was cancelled.' >&2; return 1; }
+	case "$PENDING_DIR" in "$AUTH_DIR"/.pending.*) ;; *) PENDING_DIR=""; return 1 ;; esac
+	[ ! -L "$PENDING_DIR" ] && [ -d "$PENDING_DIR" ] &&
+		[ "$(stat -c '%u:%a' "$PENDING_DIR")" = 0:700 ] &&
+		[ ! -L "$PENDING_DIR/value.json" ] && [ -f "$PENDING_DIR/value.json" ] &&
+		[ "$(stat -c '%u:%a' "$PENDING_DIR/value.json")" = 0:600 ] || return 1
+	acquire_management_lock || return 1
+	NEW_SLOT="$(find_free_slot)" || { echo 'Error: no free WAN slot remains.' >&2; return 4; }
+	uci -q show network >/dev/null || return 1
+	initialize_history || return 1
+	TRIES=0
+	while [ "$TRIES" -lt 32 ]; do
+		RANDOM_BYTES="$(hexdump -n 5 -v -e '1/1 "%02x:"' /dev/urandom 2>/dev/null)" || {
+			echo 'Error: random source failed.' >&2; return 1;
+		}
+		NEW_MAC="02:${RANDOM_BYTES%:}"
+		printf '%s' "$NEW_MAC" | grep -Eq '^02(:[0-9a-f]{2}){5}$' || { echo 'Error: random source failed.' >&2; return 1; }
+		grep -Fqx "$NEW_MAC" "$HISTORY" || break
+		TRIES=$((TRIES + 1))
+	done
+	[ "$TRIES" -lt 32 ] || { echo 'Error: random MAC collision limit reached.' >&2; return 1; }
+	printf '%s\n' "$NEW_MAC" >>"$HISTORY" || return 1
+	NEW_IFACE="wan$NEW_SLOT"; NEW_DSEC="wan${NEW_SLOT}dev"; NEW_DEVICE="macwan$NEW_SLOT"
+	wait_for_updater
+	[ ! -d "$LOCK" ] && backup_network || return 1
+	ROLLBACK=1
+	create_random_path || { echo 'Error: new WAN creation failed; rolling back.' >&2; return 1; }
+	if ! wait_for_mac "$NEW_DEVICE" "$NEW_MAC"; then
+		echo 'Error: new WAN device MAC did not apply; rolling back.' >&2; return 1
+	fi
+	# Network + private credentials are complete. Authentication failure retains them.
+	ROLLBACK=0
+	IP="$(wait_for_ip "$NEW_IFACE")"
+	run_update || return 1
+	if [ -z "$IP" ]; then
+		echo "Created $NEW_IFACE: MAC=$NEW_MAC; retained offline (no DHCP). Use auth set and manual refresh."; return 1
+	fi
+	AUTH_OK=0
+	"$AUTH_COMMAND" login "$NEW_IFACE" &
+	AUTH_PIDS="$!"
+	wait "$AUTH_PIDS" && AUTH_OK=1
+	AUTH_PIDS=""
+	run_update || return 1
+	if [ "$AUTH_OK" = 1 ] && grep -q "^$NEW_IFACE .* state=active" "$STATUS_FILE"; then
+		echo "Added and authenticated $NEW_IFACE: MAC=$NEW_MAC IP=$IP"; return 0
+	fi
+	echo "Created $NEW_IFACE: MAC=$NEW_MAC; retained offline. Credentials retained; correct them and run manual refresh."
+	return 1
+}
+
 backup_network() {
 	BACKUP_DIR=/root/hitwh-mwan-backups
 	mkdir -p "$BACKUP_DIR"
 	chmod 700 "$BACKUP_DIR"
-	cp /etc/config/network "$BACKUP_DIR/network-$(date +%Y%m%d-%H%M%S)"
+	cp /etc/config/network "$BACKUP_DIR/network-$(date +%Y%m%d-%H%M%S)" || return 1
+	# Bound flash usage; only this command's own flat network snapshots expire.
+	ls -1t "$BACKUP_DIR"/network-* 2>/dev/null | awk 'NR>8' | while IFS= read -r OLD_BACKUP; do
+		[ ! -f "$OLD_BACKUP" ] || rm -f "$OLD_BACKUP"
+	done
 }
 
 find_device_section() {
@@ -153,7 +380,11 @@ wait_for_ip() {
 }
 
 cmd_set_main() {
-	cmd_edit "$MAIN_INTERFACE" "$1"
+	cmd_edit "$MAIN_INTERFACE" "$1" || return $?
+	if [ "$MAIN_ENROLLED" = 0 ]; then
+		uci set hitwh_mwan.main.main_enrolled=1 && uci commit hitwh_mwan || return 1
+		run_update
+	fi
 }
 
 cmd_add() {
@@ -175,16 +406,7 @@ cmd_add() {
 		exit 0
 	}
 
-	SLOT=""
-	N=2
-	while [ "$N" -le "$MAX_PATHS" ]; do
-		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
-		if ! uci -q get "network.wan$N" >/dev/null; then
-			SLOT="$N"
-			break
-		fi
-		N=$((N + 1))
-	done
+	SLOT="$(find_free_slot || true)"
 	[ -n "$SLOT" ] || {
 		echo "Error: the configured maximum of $MAX_PATHS paths has been reached."
 		exit 4
@@ -229,7 +451,7 @@ cmd_add() {
 	run_update
 
 	if [ -n "$IP" ]; then
-		STATE="$(grep "^$IFACE " /tmp/hitwh-mwan.status | sed -n 's/.* state=\([^ ]*\).*/\1/p')"
+		STATE="$(grep "^$IFACE " "$STATUS_FILE" | sed -n 's/.* state=\([^ ]*\).*/\1/p')"
 		echo "Added $IFACE: MAC=$MAC IP=$IP state=${STATE:-unknown}"
 	else
 		echo "Created $IFACE, but DHCP has not returned an address. The monitor will retry."
@@ -368,9 +590,17 @@ cmd_edit() {
 }
 
 cmd_remove() {
+	case "$1" in "$MAIN_INTERFACE"|wan1|1)
+		[ "$MAIN_ENROLLED" != 0 ] || { echo 'Main path is not enrolled.'; return 3; }
+		initialize_history && backup_network && "$AUTH_COMMAND" remove "$MAIN_INTERFACE" || return 1
+		uci set hitwh_mwan.main.main_enrolled=0 && uci commit hitwh_mwan || return 1
+		run_update || return 1
+		echo "Removed $MAIN_INTERFACE from the pool. Physical uplink retained."
+		return 0 ;;
+	esac
 	SLOT="$(resolve_slot "$1" || true)"
 	case "$SLOT" in
-		''|1|*[!0-9]*)
+		''|0*|1|*[!0-9]*)
 			echo "Error: only wan2 through wan$MAX_PATHS can be removed."
 			exit 2
 			;;
@@ -386,12 +616,15 @@ cmd_remove() {
 		echo "$IFACE does not exist."
 		exit 3
 	}
-	is_managed_path "$SLOT" || {
+	[ "$SLOT" -ne 6 ] && is_managed_path "$SLOT" || {
 		echo "Refusing to remove $IFACE: it was not created by HITwh dorm multi-WAN."
 		exit 4
 	}
 	ZONE="$(wan_zone)" || exit 5
 
+	# Persist all known addresses before removing this identity.
+	initialize_history || exit 1
+	"$AUTH_COMMAND" remove "$IFACE" || exit 1
 	wait_for_updater
 	backup_network
 	ifdown "$IFACE" || true
@@ -413,7 +646,7 @@ cmd_list() {
 
 print_status() {
 	cat "$STATUS_FILE"
-	if ! grep -q "^$MAIN_INTERFACE " "$STATUS_FILE"; then
+	if [ "$MAIN_ENROLLED" != 0 ] && ! grep -q "^$MAIN_INTERFACE " "$STATUS_FILE"; then
 		MAC="$(uci -q get "network.$MAIN_INTERFACE.macaddr")"
 		[ -n "$MAC" ] || MAC="$(cat "/sys/class/net/$PARENT_DEVICE/address" 2>/dev/null)"
 		echo "$MAIN_INTERFACE mac=$MAC ip=none state=no-dhcp mark=0x101"
@@ -431,7 +664,7 @@ print_status() {
 }
 
 managed_paths() {
-	echo "$MAIN_INTERFACE"
+	[ "$MAIN_ENROLLED" = 0 ] || echo "$MAIN_INTERFACE"
 	N=2
 	while [ "$N" -le "$MAX_PATHS" ]; do
 		if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
@@ -441,9 +674,17 @@ managed_paths() {
 }
 
 cmd_refresh() {
-	run_update
+	TARGET_IFACE="${1:-}"
+	if [ -n "$TARGET_IFACE" ]; then
+		FOUND=0
+		for CANDIDATE in $(managed_paths); do [ "$CANDIDATE" != "$TARGET_IFACE" ] || FOUND=1; done
+		[ "$FOUND" = 1 ] || { echo 'Error: not a managed path.' >&2; return 2; }
+	fi
+	start_refresh_budget
+	run_update || return 1
 	OFFLINE=""
 	for IFACE in $(managed_paths); do
+		[ -z "$TARGET_IFACE" ] || [ "$IFACE" = "$TARGET_IFACE" ] || continue
 		grep -q "^$IFACE .* state=active" "$STATUS_FILE" || OFFLINE="$OFFLINE $IFACE"
 	done
 
@@ -455,9 +696,19 @@ cmd_refresh() {
 		return 0
 	fi
 
-	for IFACE in "$@"; do ifdown "$IFACE" >/dev/null 2>&1 || true; done
-	sleep 1
-	for IFACE in "$@"; do ifup "$IFACE" >/dev/null 2>&1 || true; done
+	# Authentication does not require interrupting an addressed interface.
+	# Only missing DHCP addresses need the legacy interface reconnect.
+	RECONNECT=""
+	for IFACE in "$@"; do
+		IP="$(ubus call "network.interface.$IFACE" status 2>/dev/null |
+			jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+		[ -n "$IP" ] || RECONNECT="$RECONNECT $IFACE"
+	done
+	if [ -n "$RECONNECT" ]; then
+		for IFACE in $RECONNECT; do ifdown "$IFACE" >/dev/null 2>&1 || true; done
+		sleep 1
+		for IFACE in $RECONNECT; do ifup "$IFACE" >/dev/null 2>&1 || true; done
+	fi
 
 	WAIT=0
 	while [ "$WAIT" -lt 20 ]; do
@@ -472,7 +723,23 @@ cmd_refresh() {
 		WAIT=$((WAIT + 1))
 	done
 
-	run_update
+	run_update || return 1
+	# At most three source-bound login attempts at once. No other manager,
+	# updater, monitor, or hotplug action calls the login helper.
+	BATCH=0
+	for IFACE in "$@"; do
+		grep -q "^$IFACE .* state=active" "$STATUS_FILE" && continue
+		if [ -x "$AUTH_COMMAND" ]; then
+			"$AUTH_COMMAND" login "$IFACE" &
+			AUTH_PIDS="$AUTH_PIDS $!"
+		else
+			printf 'AUTH_RESULT %s helper_unavailable\n' "$IFACE"
+		fi
+		BATCH=$((BATCH + 1))
+		if [ "$BATCH" -eq 3 ]; then wait_auth_batch; BATCH=0; fi
+	done
+	wait_auth_batch
+	run_update || return 1
 	REMAINING=0
 	for IFACE in "$@"; do
 		grep -q "^$IFACE .* state=active" "$STATUS_FILE" || REMAINING=$((REMAINING + 1))
@@ -506,25 +773,53 @@ cmd_speed() {
 case "$1" in
 	set-main)
 		[ -n "$2" ] || { usage; exit 1; }
+		acquire_management_lock || exit 1
 		cmd_set_main "$2"
 		;;
 	add)
-		[ -n "$2" ] || { usage; exit 1; }
-		cmd_add "$2"
+		if [ "$2" = random ]; then
+			[ "$#" -eq 2 ] || { [ "$#" -eq 3 ] && [ "$3" = --stdin ]; } || { usage; exit 1; }
+			cmd_add_random "${3:-}"
+		else
+			[ "$#" -eq 2 ] || { usage; exit 1; }
+			acquire_management_lock || exit 1; cmd_add "$2"
+		fi
 		;;
 	edit)
 		[ "$#" -eq 3 ] || { usage; exit 1; }
+		acquire_management_lock || exit 1
 		cmd_edit "$2" "$3"
 		;;
 	remove)
 		[ -n "$2" ] || { usage; exit 1; }
+		acquire_management_lock || exit 1
 		cmd_remove "$2"
 		;;
 	list)
 		cmd_list
 		;;
 	refresh)
-		cmd_refresh
+		[ "$#" -le 2 ] || { usage; exit 1; }
+		acquire_management_lock || exit 1
+		cmd_refresh "${2:-}"
+		;;
+	auth)
+		case "$2" in
+			status)
+				if [ "$#" -eq 2 ]; then
+					for AUTH_IFACE in $(managed_paths); do "$AUTH_COMMAND" status "$AUTH_IFACE" || exit 1; done
+				elif [ "$#" -eq 3 ]; then "$AUTH_COMMAND" status "$3"
+				else usage; exit 1; fi ;;
+			set|get|import|remove)
+				[ "$#" -eq 3 ] || { usage; exit 1; }
+				[ "$2" = get ] || acquire_management_lock || exit 1
+				"$AUTH_COMMAND" "$2" "$3" ;;
+			*) usage; exit 1 ;;
+		esac
+		;;
+	portal)
+		[ "$#" -le 2 ] || { usage; exit 1; }
+		"$AUTH_COMMAND" discover "${2:-$MAIN_INTERFACE}"
 		;;
 	speed)
 		cmd_speed "$2"

@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,11 +27,23 @@ def mock_command():
             output = state['config'].get(rest[0], '')
             result = 0 if output else 1
         elif action == 'show':
-            output = '\n'.join(f'{key}={value}' for key, value in state['config'].items()
-                               if key.startswith(rest[0] + '.') and key.count('.') == 1)
+            output = '\n'.join(f'{key}={value if key.count(".") == 1 else chr(39) + value + chr(39)}'
+                               for key, value in state['config'].items() if key.startswith(rest[0] + '.'))
         elif action == 'set':
             key, value = rest[0].split('=', 1)
+            if state.get('fail_set') == key: raise SystemExit(1)
             state['config'][key] = value
+            change = True
+        elif action == 'delete':
+            key = rest[0]
+            state['config'] = {k: v for k, v in state['config'].items() if k != key and not k.startswith(key + '.')}
+            change = True
+        elif action in ('add_list', 'del_list'):
+            key, value = rest[0].split('=', 1)
+            values = state['config'].get(key, '').split()
+            values = [v for v in values if v != value]
+            if action == 'add_list': values.append(value)
+            state['config'][key] = ' '.join(values)
             change = True
         elif action == 'commit':
             change = True
@@ -39,7 +52,7 @@ def mock_command():
     elif name in ('ifdown', 'ifup'):
         iface = args[0]
         state['up'][iface] = name == 'ifup'
-        if name == 'ifup': state['ips'][iface] = state['renewed_ips'][iface]
+        if name == 'ifup': state['ips'][iface] = state['renewed_ips'].get(iface, None if state.get('no_new_dhcp') else '10.0.0.44')
         change = True
     elif name == 'network':
         if args != ['reload']: raise AssertionError(args)
@@ -49,7 +62,7 @@ def mock_command():
             config = state['config']
             main = config['hitwh_mwan.main.main_interface']
             parent = config['hitwh_mwan.main.parent_device']
-            for iface in state['up']:
+            for iface in [key.split('.')[1] for key, value in config.items() if key.count('.') == 1 and value == 'interface']:
                 dev = config.get(f'network.{iface}.device', parent if iface == main else '')
                 device_sections = [key for key, value in config.items()
                                    if value == 'device' and config.get(key + '.name') == dev]
@@ -65,9 +78,10 @@ def mock_command():
         address = state['ips'].get(iface) if state['up'].get(iface) else None
         output = json.dumps({'ipv4-address': [{'address': address}]} if address else {})
     elif name == 'jsonfilter':
-        data = json.load(sys.stdin)
-        output = data.get('ipv4-address', [{}])[0].get('address', '')
+        data = json.loads(Path(args[args.index('-i') + 1]).read_text()) if '-i' in args else json.load(sys.stdin)
+        output = data.get('mac', '') if '@.mac' in args else data.get('ipv4-address', [{}])[0].get('address', '')
     elif name == 'update':
+        if state.get('update_failure'): raise SystemExit(1)
         rows = []
         for iface, ip in state['ips'].items():
             if not state['up'][iface] or not ip: continue
@@ -76,7 +90,63 @@ def mock_command():
         Path(os.environ['HITWH_MWAN_STATUS']).write_text('\n'.join(rows) + '\n')
         change = True
     elif name == 'sleep':
-        pass
+        # Keep only the global watchdog real; DHCP/updater waits are simulated.
+        if args == ['270']:
+            import time
+            time.sleep(270)
+    elif name == 'auth':
+        directory = Path(os.environ['HITWH_MWAN_AUTH_DIR'])
+        if args[0] in ('prepare','prepare-import'):
+            if state.get('cancel_input'): raise SystemExit(1)
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            pending = Path(tempfile.mkdtemp(prefix='.pending.', dir=directory))
+            value = pending / 'value.json'
+            values = json.load(sys.stdin) if args[0] == 'prepare-import' else {'username': 'fake-user', 'password': 'fake-secret &账'}
+            value.write_text(json.dumps(values))
+            value.chmod(0o600)
+            output = str(pending)
+        elif args[0] == 'import':
+            if state.get('fail_import'): raise SystemExit(1)
+            data = json.load(sys.stdin)
+            data['mac'] = state['config'][f'network.{args[1]}dev.macaddr']
+            file = directory / (args[1] + '.json')
+            file.write_text(json.dumps(data)); file.chmod(0o600)
+            output = f'AUTH_RESULT {args[1]} saved'
+        elif args[0] == 'remove':
+            (directory / (args[1] + '.json')).unlink(missing_ok=True)
+            output = f'AUTH_RESULT {args[1]} removed'
+        elif args[0] == 'login':
+            if state.get('block_auth'):
+                import time
+                (Path(os.environ['EDIT_MOCK_ROOT']) / 'auth.running').write_text(str(os.getpid()))
+                time.sleep(120)
+            result = 1 if state.get('auth_failure') else 0
+            state['healthy'][args[1]] = not result
+            output = f'AUTH_RESULT {args[1]} {"authentication_failed" if result else "success"}'
+        else: raise AssertionError(args)
+        change = True
+    elif name == 'id':
+        output = '0'
+    elif name == 'stat':
+        output = f'0:{stat.S_IMODE(Path(args[-1]).stat().st_mode):o}'
+    elif name == 'dd':
+        state['random_calls'] = state.get('random_calls', 0) + 1
+        state_path.write_text(json.dumps(state))
+        if state.get('random_failure'): raise SystemExit(1)
+        candidates = state.get('random_candidates', ['10:20:30:40:50'])
+        sys.stdout.buffer.write(bytes.fromhex(candidates[min(state['random_calls'] - 1, len(candidates) - 1)].replace(':', '')))
+        raise SystemExit(0)
+    elif name == 'hexdump':
+        if '/dev/urandom' in args:
+            state['random_calls'] = state.get('random_calls', 0) + 1
+            state_path.write_text(json.dumps(state))
+            if state.get('random_failure'): raise SystemExit(1)
+            candidates = state.get('random_candidates', ['10:20:30:40:50'])
+            output = candidates[min(state['random_calls'] - 1, len(candidates) - 1)] + ':'
+        else:
+            output = ''.join(f'{byte:02x}:' for byte in sys.stdin.buffer.read())
+    elif name == 'firewall':
+        change = True
     else:
         raise AssertionError(name)
     if change:
@@ -99,6 +169,7 @@ class EditTests(unittest.TestCase):
             'network.wan': 'interface',
             'network.wan.device': 'eth1',
             'network.wan.macaddr': '02:00:00:00:00:01',
+            'firewall.wan': 'zone', 'firewall.wan.name': 'wan', 'firewall.wan.network': 'wan wan2 wan3',
         }
         for slot in (2, 3):
             config.update({
@@ -121,6 +192,7 @@ class EditTests(unittest.TestCase):
         }
         self.save()
         (self.root / 'network').write_text('original network\n')
+        (self.root / 'module/macvlan').mkdir(parents=True)
         physical = self.root / 'sys/eth1'
         physical.mkdir(parents=True)
         (physical / 'address').write_text('02:00:00:00:00:01\n')
@@ -135,7 +207,9 @@ class EditTests(unittest.TestCase):
             ('/root/hitwh-mwan-backups', fixture + '/backups'),
             ('/etc/config/network', fixture + '/network'),
             ('/etc/init.d/network', f'"{fixture}/bin/network"'),
+            ('/etc/init.d/firewall', f'"{fixture}/bin/firewall"'),
             ('/sys/class/net', fixture + '/sys'),
+            ('/sys/module/macvlan', fixture + '/module/macvlan'),
         ):
             source = source.replace(old, new)
         self.script = self.root / 'manager.sh'
@@ -143,7 +217,7 @@ class EditTests(unittest.TestCase):
             file.write(source)
         bindir = self.root / 'bin'
         bindir.mkdir()
-        for name in ('uci', 'ubus', 'jsonfilter', 'ifdown', 'ifup', 'network', 'update', 'sleep'):
+        for name in ('uci', 'ubus', 'jsonfilter', 'ifdown', 'ifup', 'network', 'update', 'sleep', 'auth', 'id', 'stat', 'dd', 'hexdump', 'firewall'):
             file = bindir / name
             with file.open('w', newline='\n') as command_file:
                 command_file.write(f'#!/bin/sh\nexec "$EDIT_MOCK_PYTHON" "$EDIT_MOCK_DISPATCH" --mock {name} "$@"\n')
@@ -163,6 +237,8 @@ class EditTests(unittest.TestCase):
             'EDIT_MOCK_SCRIPT': self.script.as_posix(),
             'HITWH_MWAN_UPDATE': (bindir / 'update').as_posix(),
             'HITWH_MWAN_STATUS': (self.root / 'status').as_posix(),
+            'HITWH_MWAN_AUTH': (bindir / 'auth').as_posix(),
+            'HITWH_MWAN_AUTH_DIR': (self.root / 'private/auth.d').as_posix(),
         }
         self.command = [shell, '-c', 'export PATH="$EDIT_MOCK_BIN:$PATH"; exec sh "$EDIT_MOCK_SCRIPT" "$@"', 'manager']
 
@@ -172,11 +248,90 @@ class EditTests(unittest.TestCase):
         result = subprocess.run([*self.command, *args], env=self.env, text=True, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.state = json.loads(self.state_path.read_text())
-        return result.stdout
+        return result.stdout + result.stderr
 
     def assert_no_changes(self):
         self.assertEqual(self.state['events'], [])
         self.assertFalse((self.root / 'backups').exists())
+
+    def test_refresh_authenticates_only_offline_and_does_not_restart_addressed_paths(self):
+        self.state['healthy']['wan2'] = False
+        self.save()
+        self.assertIn('RESULT 1 1 0', self.run_manager('refresh'))
+        self.assertEqual([e for e in self.state['events'] if e[0] == 'auth'], [['auth', 'login', 'wan2']])
+        self.assertFalse(any(e[0] in ('ifdown', 'ifup') for e in self.state['events']))
+
+    def test_refresh_recovers_dhcp_before_authenticating(self):
+        self.state['ips']['wan2'] = None
+        self.state['healthy']['wan2'] = False
+        self.save()
+        self.assertIn('RESULT 1 1 0', self.run_manager('refresh'))
+        self.assertEqual([e for e in self.state['events'] if e[0] in ('ifdown', 'ifup', 'auth')],
+                         [['ifdown', 'wan2'], ['ifup', 'wan2'], ['auth', 'login', 'wan2']])
+
+    def test_all_online_and_list_never_authenticate(self):
+        self.assertIn('RESULT 0 0 0', self.run_manager('refresh'))
+        self.state['healthy']['wan2'] = False
+        self.save()
+        self.run_manager('list')
+        self.assertFalse(any(e[0] == 'auth' for e in self.state['events']))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX signal and lock behavior')
+    def test_cancel_refresh_terminates_authentication_and_releases_lock(self):
+        import time
+        self.state['healthy']['wan2'] = False
+        self.state['block_auth'] = True; self.save()
+        process = subprocess.Popen([*self.command, 'refresh'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        marker = self.root / 'auth.running'
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline: time.sleep(0.02)
+        self.assertTrue(marker.exists())
+        auth_pid = int(marker.read_text())
+        process.terminate()
+        process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 143)
+        with self.assertRaises(ProcessLookupError): os.kill(auth_pid, 0)
+        self.state = json.loads(self.state_path.read_text())
+        self.state['block_auth'] = False
+        self.state['healthy']['wan2'] = True; self.save()
+        self.assertIn('RESULT 0 0 0', self.run_manager('refresh'))
+
+    def test_remove_always_protects_reserved_wan6(self):
+        self.state['config']['hitwh_mwan.main.max_paths'] = '7'
+        for key, value in list(self.state['config'].items()):
+            if key.startswith('network.wan2'):
+                self.state['config'][key.replace('wan2', 'wan6')] = value.replace('macwan2', 'macwan6')
+        self.save()
+        self.run_manager('remove', 'wan6', expected=4)
+        self.assert_no_changes()
+
+    def test_refresh_does_not_authenticate_without_a_successful_route_update(self):
+        self.state['healthy']['wan2'] = False
+        self.state['update_failure'] = True; self.save()
+        self.run_manager('refresh', expected=1)
+        self.assertFalse(any(e[0] in ('auth', 'ifdown', 'ifup') for e in self.state['events']))
+        self.state['update_failure'] = False; self.save()
+        (self.root / 'hitwh-mwan-update.lock').mkdir()
+        self.run_manager('refresh', expected=1)
+        self.assertFalse(any(e[0] == 'auth' for e in self.state['events']))
+
+    def test_single_refresh_authenticates_only_selected_roommate_path(self):
+        self.state['healthy'].update(wan2=False,wan3=False); self.save()
+        self.assertIn('RESULT 1 1 0',self.run_manager('refresh','wan2'))
+        self.assertEqual([e for e in self.state['events'] if e[0]=='auth'],[['auth','login','wan2']])
+        self.assertFalse(self.state['healthy']['wan3'])
+
+    def test_refresh_rejects_nonmanaged_target_before_any_update(self):
+        self.run_manager('refresh','wan6',expected=2)
+        self.assertFalse(self.state['events'])
+
+    def test_unenrolled_physical_wan_is_not_authenticated(self):
+        self.state['config']['hitwh_mwan.main.main_enrolled']='0'
+        self.state['healthy']['wan']=False; self.save()
+        self.assertIn('RESULT 0 0 0',self.run_manager('refresh'))
+        self.assertFalse(any(e[0]=='auth' for e in self.state['events']))
+
 
     def test_edit_subwan_preserves_other_configuration_and_reconnects_only_target(self):
         original = self.state['config'].copy()

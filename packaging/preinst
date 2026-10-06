@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+grep -q "24.10" /etc/openwrt_release || { echo 'This package targets OpenWrt 24.10/opkg.' >&2; exit 1; }
+for CMD in flock stat hexdump ucode curl ip nft; do
+    command -v "$CMD" >/dev/null || { echo "Missing runtime: $CMD; supply its matching offline IPK first." >&2; exit 1; }
+done
+AVAILABLE="$(df -Pk /overlay | awk 'NR==2 {print $4}')"
+[ "${AVAILABLE:-0}" -ge 4096 ] || { echo 'At least 4 MiB free overlay space is required, including opkg metadata.' >&2; exit 1; }
+umask 077
+[ ! -L /tmp/hitwh-mwan-install ] || exit 1
+mkdir -p /tmp/hitwh-mwan-install
+[ "$(stat -c '%u:%a' /tmp/hitwh-mwan-install)" = 0:700 ] || exit 1
+if [ -f /etc/config/hitwh_mwan ]; then cp /etc/config/hitwh_mwan /tmp/hitwh-mwan-install/config; fi
+BACKUP=/root/hitwh-mwan-backups/ipk-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$BACKUP"
+chmod 700 /root/hitwh-mwan-backups "$BACKUP"
+cp /etc/config/network "$BACKUP/network"
+cp /etc/config/firewall "$BACKUP/firewall"
+[ ! -f /etc/config/hitwh_mwan ] || cp /etc/config/hitwh_mwan "$BACKUP/hitwh_mwan"
+# Retain three package-install snapshots; other backup categories are untouched.
+ls -1dt /root/hitwh-mwan-backups/ipk-* 2>/dev/null | awk 'NR>3' | while IFS= read -r OLD; do
+    case "$OLD" in /root/hitwh-mwan-backups/ipk-*) ;; *) exit 1 ;; esac
+    [ ! -L "$OLD" ] || continue
+    rm -f "$OLD/network" "$OLD/firewall" "$OLD/hitwh_mwan"
+    rmdir "$OLD" 2>/dev/null || true
+done

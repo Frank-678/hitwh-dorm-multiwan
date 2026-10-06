@@ -20,7 +20,9 @@ logread -e wan2 | tail -n 50
 
 ## 有 DHCP 地址但 `state=inactive`
 
-这通常表示认证没有生效。把路由器从墙口拔下，电脑直接接墙口并设置为该 MAC，然后访问 `http://neverssl.com`，完成认证并开启无感知登录。
+这通常表示认证没有生效。先在 LuCI 的“多路合并管理器”添加该 WAN 的凭据，或通过 SSH 执行 `hitwh-mwan auth set wan2`，再单独 `hitwh-mwan refresh wan2`。保存凭据或后台掉线检测本身不会登录。
+
+需要验证码或门户使用尚未支持的加密/服务选择时，可把路由器从墙口拔下，电脑直接接墙口并设置为该 MAC，然后访问 `http://neverssl.com`，完成认证。
 
 认证结束前不要让电脑与路由器同时使用相同 MAC。完成后接回路由器并执行：
 
@@ -29,12 +31,15 @@ hitwh-mwan refresh
 hitwh-mwan list
 ```
 
-`hitwh-mwan refresh` 会先检查全部线路，仅对 `inactive` 或 `no-dhcp` 的受管线路执行
-`ifdown`/`ifup`，等待 DHCP 后再次检查。若结果仍为 `inactive`，通常需要重新认证，单纯重启接口无法绕过认证门户。
+`hitwh-mwan refresh` 先检查全部线路；只对没有 DHCP 地址的离线受管线路执行 `ifdown`/`ifup`。有地址的线路直接使用各自凭据尝试认证，不中断在线 WAN。每条线路最多登录一次，失败后等待下一次人工刷新。
+
+常见 `AUTH_RESULT`：`missing_credentials` 为未配置；`mac_mismatch` 需重新保存凭据确认 MAC；`insecure_storage` 需检查 root 属主及目录 `0700`、文件 `0600`；`authentication_failed` 需核对账号密码；`portal_not_detected` 表示没有发现配置的可信门户；`captcha_required`、`encryption_required`、`service_required` 需手动登录；`verification_failed` 表示登录后目标 WAN 仍未通过 204 检查。不要通过公开日志或 Issue 提供密码和原始门户响应。
 
 ## 主 WAN 掉线，刷新无效
 
-先执行 `hitwh-mwan list`。主 WAN 有地址但 `state=inactive` 通常是校园网认证失效；刷新只能重启接口，不能重新提交认证。主 WAN 需按上面的步骤重新认证其原 MAC。
+先执行 `hitwh-mwan list`。主 WAN 有地址但 `state=inactive` 通常是校园网认证失效。配置主 WAN 的凭据后手动刷新，核对固定失败原因；旧组件需离线安装新版 IPK。修改主 WAN MAC 后必须重新保存凭据确认绑定。新安装的物理 WAN 默认不在池中，应通过 GUI 创建虚拟线路。
+
+`add random` 失败若显示 `retained offline`，说明新接口和固定 MAC 已保留。不要重复添加来重试认证；修改该 WAN 的凭据并手动刷新。容量/随机源/创建失败则没有保留新线路，已尝试的 MAC 仍登记历史。
 
 新版默认启用 `router_failover=1`：主 WAN 离线时，客户端新连接使用其他在线出口，路由器自身默认出口也会切到健康副 WAN。主 WAN 恢复后自动切回，无需把副 WAN 的 MAC 复制到物理 WAN。查看状态：
 

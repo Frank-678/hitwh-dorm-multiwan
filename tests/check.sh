@@ -4,7 +4,7 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
-find "$ROOT" -type f \( -name '*.sh' -o -name '*.command' -o -path '*/usr/sbin/*' -o -path '*/init.d/*' -o -path '*/hotplug.d/*' \) |
+find "$ROOT" -type f \( -name '*.sh' -o -name '*.command' -o -path '*/usr/sbin/*' -o -path '*/usr/libexec/*' -o -path '*/packaging/*' -o -path '*/.githooks/pre-commit' -o -path '*/init.d/*' -o -path '*/hotplug.d/*' \) |
 while IFS= read -r FILE; do
 	sh -n "$FILE"
 done
@@ -26,7 +26,7 @@ case "$*" in
 esac
 EOF
 chmod 755 "$MOCK_DIR/uci"
-if PATH="$MOCK_DIR:$PATH" sh "$ROOT/files/usr/sbin/hitwh-mwan" remove wan6 >"$MOCK_DIR/output" 2>&1; then
+if HITWH_MWAN_MANAGEMENT_LOCK="$MOCK_DIR/manager.lock" PATH="$MOCK_DIR:$PATH" sh "$ROOT/files/usr/sbin/hitwh-mwan" remove wan6 >"$MOCK_DIR/output" 2>&1; then
 	echo "hitwh-mwan remove wan6 unexpectedly succeeded" >&2
 	exit 1
 fi
@@ -86,6 +86,7 @@ echo 10.0.0.2
 EOF
 cat >"$MOCK_DIR/sleep" <<'EOF'
 #!/bin/sh
+[ "$1" != 270 ] || exec /bin/sleep 270
 exit 0
 EOF
 chmod 755 "$MOCK_DIR/uci" "$MOCK_DIR/update" "$MOCK_DIR/ifdown" \
@@ -94,16 +95,16 @@ TEST_UPDATE_COUNT="$MOCK_DIR/update-count" \
 TEST_ACTIONS="$MOCK_DIR/actions" \
 HITWH_MWAN_UPDATE="$MOCK_DIR/update" \
 HITWH_MWAN_STATUS="$MOCK_DIR/status" \
+HITWH_MWAN_REFRESH_LOCK="$MOCK_DIR/refresh.lock" \
 PATH="$MOCK_DIR:$PATH" \
 	sh "$ROOT/files/usr/sbin/hitwh-mwan" refresh >"$MOCK_DIR/output"
-grep -qx 'ifdown wan2' "$MOCK_DIR/actions"
-grep -qx 'ifup wan2' "$MOCK_DIR/actions"
+[ ! -f "$MOCK_DIR/actions" ]
 grep -q '^RESULT 1 1 0$' "$MOCK_DIR/output"
 rm -rf "$MOCK_DIR"
 trap - EXIT INT TERM
 
 if command -v shellcheck >/dev/null 2>&1; then
-	find "$ROOT" -type f \( -name '*.sh' -o -name '*.command' -o -path '*/usr/sbin/*' -o -path '*/init.d/*' -o -path '*/hotplug.d/*' \) -print0 |
+	find "$ROOT" -type f \( -name '*.sh' -o -name '*.command' -o -path '*/usr/sbin/*' -o -path '*/usr/libexec/*' -o -path '*/packaging/*' -o -path '*/.githooks/pre-commit' -o -path '*/init.d/*' -o -path '*/hotplug.d/*' \) -print0 |
 		xargs -0 shellcheck --shell=sh --severity=error
 fi
 

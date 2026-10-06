@@ -1,0 +1,8 @@
+{
+  "admin/network/hitwh-mwan": {
+    "title": "多路合并管理器",
+    "order": 70,
+    "action": { "type": "view", "path": "network/hitwh-mwan" },
+    "depends": { "acl": [ "luci-app-hitwh-mwan" ] }
+  }
+}

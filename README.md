@@ -1,74 +1,141 @@
-# HITwh 寝室校园网多路聚合
+# 多路合并管理器
 
-在哈尔滨工业大学（威海）寝室的一个有线网口上，通过 OpenWrt `macvlan` 创建多个独立 MAC/DHCP 会话，并用 nftables 与策略路由进行**按连接负载均衡**。当校园网按已认证终端独立限速时，三个已认证 MAC 可以让多线程下载和多设备并发流量达到接近三倍的持续总带宽。
+在 OpenWrt 路由器上，把一个有线校园网口提供的多个 MAC/DHCP 会话组成线路池。LuCI 图形界面负责新增、刷新、修改和删除线路；nftables 与策略路由按连接分配出口。账号认证只在用户新增随机线路或手动刷新时执行。
 
-> 本项目只用于本人账号或明确获授权的校园网终端。请遵守学校网络使用规定。项目不会绕过认证，也不会保存账号和密码。
+项目最初用于哈尔滨工业大学（威海）的锐捷 ePortal 网络。核心实现使用 OpenWrt 自带的 shell、ucode、rpcd 和 LuCI，路由器不需要安装 Python、Node.js 或 Go。页面的流量历史保存在浏览器内存中。
 
-## 已验证环境
+## 适用条件
 
-- 校区：哈尔滨工业大学（威海）
-- 接入：寝室墙上有线网口，DHCP 获取 `10.240.0.0/16` 地址
-- 网关：`10.240.255.254`
-- 认证：锐捷 ePortal，未认证终端会跳转到 `172.26.156.158/eportal/`
-- 限速：约 5 MB/s/已认证终端，多个终端的限速彼此独立
-- 路由器：中国移动 RAX3000M NAND 版，OpenWrt 24.10 系固件
-- 三路结果：多连接下载的持续总速度可接近 `3 × 5 MB/s`
+符合以下条件的校园网可以评估使用本方案：
 
-其他楼宇、年级或时间段的认证策略可能不同。先确认同一墙口允许多个 MAC 获取 DHCP 地址，并确认不同终端的限速彼此独立。
+- 一个宿舍有线网口允许多个不同 MAC 同时申请独立 IPv4 DHCP 租约。
+- 通过本项目支持的锐捷 **ePortal** 协议认证；当前支持无验证码、无需密码加密、无需服务选择的登录流程，以及 JavaScript/HTTP Location 门户跳转。
+- 账号允许相应数量的设备同时在线，或每条线路分别使用本人/舍友明确授权的账号。
+- 限速按已认证终端独立计算，且宿舍网口的总带宽、路由器的转发能力能够承载叠加后的流量。
 
-## 所需设备
+使用锐捷认证本身不足以保证兼容：802.1X 客户端认证、验证码、不同加密方式、服务选择、仅允许一个 MAC 或账号统一总限速，都需要另外评估或适配。不同学校需在“接入设置”中确认其可信门户地址。
 
-1. 一台 **RAX3000M** 路由器，闲鱼价格约 140 元。NAND 版已经足够，不需要 eMMC、USB 口或外置交换机。
-2. 一台可以修改有线网卡 MAC 地址的电脑，用于依次认证三个 MAC。
-3. 三个允许同时在线的校园网终端名额。优先使用本人账号允许的设备数；使用他人账号前必须获得本人授权。
+这是**按连接负载均衡**：多线程下载、多设备和多个 TCP/UDP 会话可以利用多路总带宽，单个 TCP 连接仍使用一条线路。一个账号若有统一总限速，增加 MAC 不会提高该账号的总带宽。
 
-路由器固件需要包含：
+## 已验证的 OpenWrt 环境
 
-- `kmod-macvlan`
-- `nftables`/`firewall4`
-- `ip-full`
-- `curl`
-- `jsonfilter`
+| 项目 | 本机环境 |
+| --- | --- |
+| 路由器 | CMCC RAX3000M NAND |
+| 固件 | Kwrt/OpenWrt `24.10-SNAPSHOT` |
+| 内核 | `6.6.116` |
+| Target / 架构 | `mediatek/filogic` / `aarch64_cortex-a53` |
+| Web 管理 | LuCI + nginx；也支持使用 LuCI 的 uhttpd 环境 |
+| 认证 | HITwh 锐捷 ePortal，默认 `http://172.26.156.158/eportal` |
 
-## 工作原理
+IPK 的架构为 `all`，因为包内只有脚本和页面资源；底层依赖仍必须匹配路由器固件。其他设备需有支持 macvlan 的有线 WAN、LuCI、rpcd 的 ucode 插件和足够的剩余空间。
 
-```mermaid
-flowchart LR
-    Internet[校园网网关] --- Port[寝室单个千兆墙口]
-    Port --- Eth[eth1 物理 WAN]
-    Eth --- W1[wan<br/>认证 MAC 1]
-    Eth --- W2[macwan2 / wan2<br/>认证 MAC 2]
-    Eth --- W3[macwan3 / wan3<br/>认证 MAC 3]
-    W1 --> PBR[nftables 连接标记<br/>独立策略路由表]
-    W2 --> PBR
-    W3 --> PBR
-    PBR --> NAT[OpenWrt NAT]
-    NAT --> LAN[寝室有线与 Wi-Fi 设备]
-```
+## 第一步：离线安装
 
-默认把新连接轮询分配到在线线路，TCP 与 UDP 分别使用独立计数器，避免 DNS 等 UDP 短连接占用 TCP 的轮询顺序。连接跟踪标记保证同一连接始终从原线路返回。后台每 30 秒检查一次 `204` 响应，认证失效的线路自动退出池，恢复后自动加入。
+路由器已经安装 OpenWrt，并连接宿舍网线。电脑连接路由器 LAN/Wi-Fi，即使校园网尚未认证，也能通过局域网 SSH 和 LuCI 安装配置。
 
-健康检查保留未变化的策略路由规则和路由表；只有接口地址、网关或设备变化时才调整对应线路。分流规则仅在分流模式、可用出口集合变化或防火墙规则被重置时更新，避免周期刷新破坏正在下载的连接或重置轮询顺序。策略表还保留不可达兜底路由，防止失效线路的既有连接误走默认 WAN。
-
-默认启用路由器自身流量的主备切换：优先使用主 `wan`；主 WAN 认证失效或没有 DHCP 地址时，自动选择通过健康检查的副 WAN 作为默认出口。当前副出口仍在线时继续使用它，失效后另选在线副出口；主 WAN 恢复后自动切回。切换随每轮健康检查执行，客户端仍在全部在线线路之间负载均衡。不会修改线路 MAC、交换接口身份或重启在线 WAN；失效线路上的原有连接仍需应用重连。
-
-安装器给 dnsmasq 配置受管的 `serversfile`，更新器从各线路 DHCP 状态中读取 DNS，并将查询绑定到该线路的源地址。因此主 WAN 没有 DHCP 时，副 WAN 的 DNS 仍可用于健康检查和域名解析。已有自定义 `serversfile` 会保留，此时需自行保证 DNS 不依赖主 WAN。`/tmp/hitwh-mwan.status` 的 `router_interface` 表示路由器当前默认出口，`router_state=unverified` 表示所有检查失败时保留上次仍有地址的出口，而不是认定其在线。
-
-如需关闭路由器自身的主备切换（客户端多 WAN 分流仍保留）：
+在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-3) 下载成品 `luci-app-hitwh-mwan_1.0.0-3_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
 
 ```sh
-uci set hitwh_mwan.main.router_failover='0'
-uci commit hitwh_mwan
-hitwh-mwan list
+python3 tools/build_ipk.py
+# Windows 也可以用 python tools/build_ipk.py
 ```
 
-改为 `1` 可恢复。旧 UCI 配置未设置该选项时也默认启用；升级需运行新版安装器以接入副 WAN DNS。
+构建产物在 `dist/`。将 IPK 传到路由器的 `/tmp`，然后离线安装：
 
-这不是逐包链路绑定。单个 TCP 连接仍然只能使用一条线路；百度网盘、Steam、BT、启动器、多设备并发等多连接场景最容易获得叠加效果。
+```sh
+scp -O dist/luci-app-hitwh-mwan_1.0.0-3_all.ipk root@192.168.100.1:/tmp/
+ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-3_all.ipk"
+```
 
-轮询改善新连接数量的分布，不保证各出口字节数或速度完全相等。连接速度、存活时间、HTTP/2 复用和 CDN 调度仍会影响带宽利用率。算法对照与性能边界见 [分流算法验证](docs/load-balancing.md)。
+下载的成品 IPK 可替换命令中的 `dist/...` 路径。示例使用本机 LAN 地址 `192.168.100.1`；其他路由器请替换为其 LAN 地址。`scp -O` 使用 OpenWrt Dropbear 常见的 SCP 传输方式。
 
-如需使用原来的随机分流，可在路由器上切换：
+传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-3_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
+
+安装依赖：`luci-base`、`rpcd-mod-ucode`、`ucode`、`ucode-mod-fs`、`ucode-mod-uci`、`curl`、`jsonfilter`、`ip-full`、`kmod-macvlan`、`firewall4`、`coreutils-stat`，以及提供 `flock`、`hexdump` 的 BusyBox。本机固件已具备这些依赖。
+
+如果固件缺少依赖，在联网电脑下载**该固件软件源、该架构**对应的 IPK，一起 SCP 到路由器后安装。`kmod-macvlan` 必须与正在运行的内核版本和 ABI 匹配；厂商 SNAPSHOT 固件应使用其配套源。离线安装时，路由器无法替你从互联网补齐缺失依赖。
+
+安装器会检查组件和剩余空间，备份网络/防火墙配置，启用健康监控及分流规则。它不会创建线路，也不会提交任何账号认证。新安装不把原始物理 WAN 自动加入线路池；升级保留已有配置和凭据。
+
+安装后登录 OpenWrt 的 LuCI，打开 **网络 → 多路合并管理器**。必要时刷新 LuCI 页面。页面、接口和权限校验都在路由器上运行，使用时不需要电脑保持 SSH 会话。
+
+## 第二步：确认校园网接入设置
+
+HITwh 可使用默认设置。其他学校点击“接入设置”：
+
+- **WAN 父设备**：接宿舍网口的实际网络设备，本机为 `eth1`。
+- **LAN 网桥**：客户端所在网桥，通常为 `br-lan`。
+- **可信认证门户**：学校的 ePortal 基础地址，例如 `http://认证服务器/eportal`，不填写登录 URL 的查询参数。
+- **204 检查地址**：用于确认目标线路已经通过认证的地址。
+
+“检测门户地址”只读取底层 WAN 的认证跳转，不提交账号密码。检查检测到的地址确实属于学校后，再保存设置。已有线路时无法更换 WAN 父设备，避免把现有线路迁移到错误网卡。
+
+网关与 IPv4 子网从各线路 DHCP 状态读取，不要求学校使用 `10.240.0.0/16`。如果底层 WAN 没有 DHCP 地址，先在 LuCI 网络接口中确认物理 WAN 使用 DHCP、网线接入和驱动正常。
+
+## 第三步：新增线路
+
+初次安装页面显示 **0 条已配置线路**。点击“新增线路”，选择：
+
+### 随机生成 MAC 并认证
+
+输入本次线路的校园网账号和密码，点击“添加并认证”。流程为：
+
+1. 检查容量和运行环境。
+2. 从 `/dev/urandom` 生成本地管理的单播 MAC，避开本机配置、运行时设备、凭据绑定、备份和 MAC 历史中的地址。
+3. 创建固定 MAC 的 macvlan/DHCP 线路，保存这条线路的私有凭据。
+4. 只为新线路提交一次源地址绑定的 ePortal 登录，通过 204 检查后加入在线线路池。
+
+无需在电脑上修改 MAC 或逐个预先登录。需要更多线路时重复新增，并使用允许同时在线的设备名额或其他获授权账号。
+
+创建失败会回滚本次新配置。创建完成后，DHCP 或认证失败会保留该线路、固定 MAC 和受保护凭据，并显示失败原因；修改凭据后手动刷新该线路即可。失败不会自动换 MAC、踢设备或后台重试登录。
+
+### 使用已认证的 MAC
+
+输入 MAC 后直接创建线路并检查其在线状态，不提交登录。该 MAC 应已经具有有效的校园网会话，且其他设备当前没有同时使用它。后续可以通过“添加凭据”补上账号，以便认证过期时手动恢复。
+
+新建虚拟线路使用 `wan2`、`wan3`…，跳过保留编号 `wan6`。默认可新建 15 条虚拟线路；旧配置若保留物理主 WAN 作为线路，则总共最多 16 条。
+
+## 日常使用
+
+每条线路都有独立操作：
+
+| 操作 | 行为 |
+| --- | --- |
+| 添加/查看凭据 | 查看、修改或删除该线路的账号密码；密码默认遮盖；保存不触发登录 |
+| 刷新 | 只恢复选中的线路，其他账号不参与认证 |
+| 修改 MAC | 改变该线路身份；旧凭据绑定失效，需重新保存确认 |
+| 删除线路 | 删除线路配置和凭据；保留 MAC 历史以避免复用 |
+| 刷新离线线路 | 只处理本轮离线的受管线路；在线线路不登录、不重启 |
+
+删除旧配置中的物理主线路时，它退出线路池且凭据被删除，物理设备保留作其他 macvlan 的底层接口。
+
+有 DHCP 地址的离线线路直接认证；缺少地址时先恢复 DHCP。每次刷新每条线路最多登录一次。页面打开、浏览器刷新、掉线、监控、hotplug 和路由器启动都不会提交认证。
+
+操作通过 LuCI/rpcd 异步任务执行，有有限超时且没有自动重试队列。关闭页面后，已经明确提交的单次操作仍可能完成；再次操作前查看线路状态。全体刷新预算 270 秒，单个图形操作预算约 300 秒。
+
+## 命令行方案
+
+SSH 登录路由器后，可使用同一套管理逻辑：
+
+```sh
+hitwh-mwan add random                 # 交互输入账号密码，创建并认证一条线路
+hitwh-mwan add 02:11:22:33:44:55      # 添加已认证的 MAC
+hitwh-mwan list                       # 检查/列出线路，不提交认证
+hitwh-mwan refresh wan2               # 只恢复 wan2
+hitwh-mwan refresh                    # 恢复全部离线受管线路
+hitwh-mwan auth set wan2              # 交互保存凭据，密码不回显
+hitwh-mwan auth status                # 仅显示配置是否存在，不显示账号密码
+hitwh-mwan auth remove wan2           # 删除凭据，不删除线路
+hitwh-mwan edit wan2 02:11:22:33:44:66
+hitwh-mwan remove wan2                # 删除线路及对应凭据
+hitwh-mwan portal                     # 只检测底层 WAN 的门户地址
+hitwh-mwan speed 30                   # 读取流量计数，观察 30 秒
+```
+
+`add random --stdin` 是图形界面的 JSON 标准输入入口；请通过交互命令录入密码，避免写进 shell 历史或进程参数。旧版 `set-main <MAC>` 仍可将物理主 WAN 加入线路池。
+
+默认轮询分配新 TCP/UDP 连接，既有连接保留原出口。也可切换随机分流：
 
 ```sh
 uci set hitwh_mwan.main.balance_mode='random'
@@ -76,199 +143,41 @@ uci commit hitwh_mwan
 hitwh-mwan list
 ```
 
-将值改为 `round_robin` 可恢复轮询。已有连接继续使用原出口，新算法只影响之后建立的连接；`/tmp/hitwh-mwan.status` 显示当前 `balance_mode`。升级保留旧 UCI 配置时，未设置该选项也默认采用轮询。
+改回 `round_robin` 可恢复轮询。健康线路退出/恢复会调整分流池；默认出口优先使用旧配置中仍在线的主 WAN，否则使用健康副线路。
 
-## 第一步：准备并认证三个 MAC
+## 凭据与存储
 
-可使用三个本地管理、单播 MAC，例如：
+凭据只在路由器 `/etc/hitwh-mwan/auth.d/<WAN>.json` 创建，目录 root `0700`、文件 root `0600`。它是权限保护的明文存储；root 和完整磁盘备份能够读取。默认不将凭据目录加入 sysupgrade 保留列表。
 
-```text
-02:11:22:33:44:51
-02:11:22:33:44:52
-02:11:22:33:44:53
-```
+LuCI 登录和专用 ACL 保护管理接口，凭据读取需要管理写权限。账号密码不会进入仓库、UCI 网络配置、采样 JSON、图表历史、URL、浏览器 localStorage/sessionStorage 或公共日志；子进程通过私有标准输入接收凭据。关闭凭据弹窗清空输入。
 
-不要直接照抄示例；请修改后几组十六进制数字，避免与同楼设备冲突。首字节使用 `02` 可以保证它是本地管理的单播地址。
+建议通过 HTTPS 使用 LuCI。HITwh 当前门户登录为 HTTP，因此路由器到该门户的一段仍无传输加密，文件权限不能解决这一点。项目不会关闭门户 TLS 证书校验。
 
-依次完成三次认证：
+IPK 只包含必要脚本和页面，打包器限制文件内容总量不超过 512 KiB，安装前要求至少 4 MiB 剩余 overlay，为 opkg 元数据写入留出空间。本机包约 36 KiB 压缩、115 KiB 文件内容；多次测试期间，包含 opkg 元数据和备份的 overlay 增量约 0.8–2.2 MiB，随 UBIFS 回收变化，当前仍余约 17 MiB。依赖包的空间应另计。
 
-1. 拔掉路由器 WAN，将电脑直接接到寝室墙口。
-2. 把电脑有线网卡改为第一个 MAC。
-3. 禁用并重新启用网卡，确保重新申请 DHCP 地址。
-4. 打开 `http://neverssl.com`，等待跳转至 HITwh 锐捷认证页。
-5. 使用本人或获授权账号登录，并开启“无感知认证/无感知登录”。
-6. 确认该 MAC 可以直接访问 HTTPS 网站。
-7. 换成第二、第三个 MAC，重复上述操作。
+网络配置操作保留最近 8 份平面网络快照；包安装备份保留最近 3 份，其他旧备份和 MAC 历史保留在 root 私有目录。图表历史仅占浏览器内存；操作临时文件位于 RAM 的 `/tmp`，数量有上限并按需清理，凭据交接文件读取后立即移除。
 
-认证某个 MAC 时，路由器不能同时使用这个 MAC，否则会产生二层地址冲突。不要保存或分享带完整查询参数的认证 URL。
+## 升级与卸载
 
-Windows 的“网络地址/Network Address”属性通常要求填写不带冒号的形式，例如 `021122334451`。全部认证完成后，把电脑网卡恢复为原始 MAC。
-
-## 第二步：安装
-
-路由器接回墙口，电脑连接路由器 LAN，然后 SSH 登录：
+升级同样 SCP 新 IPK 后执行 `opkg install /tmp/新版本.ipk`。现有配置和本地凭据保留，升级本身不触发认证。
 
 ```sh
-ssh root@192.168.100.1
+opkg remove luci-app-hitwh-mwan
 ```
 
-在线安装：
+卸载会停止管理和分流，保留已有网络接口、私有凭据和 MAC 历史，方便重新安装或手动迁移。需要彻底删除某条线路时，先在图形界面或 CLI 显式删除，再卸载软件包。需要清除保留的凭据时，由 root 显式删除 `/etc/hitwh-mwan/auth.d`；不要把该目录或完整系统备份上传到 Issue。
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/ponder-j/hitwh-dorm-multiwan/main/install.sh -o /tmp/install.sh
-sh /tmp/install.sh
-```
-
-也可以克隆仓库后，把整个目录复制到路由器并运行本地 `install.sh`。
-
-安装器会：
-
-- 备份 `/etc/config/network` 与 `/etc/config/firewall`
-- 安装管理、健康检查和开机启动脚本
-- 建立独立 nftables 表与策略路由规则
-- 关闭可能绕过连接标记的软硬件流量分载
-- 将自定义文件加入 OpenWrt 升级保留列表
-
-## 第三步：加入三条线路
-
-将第一个已认证 MAC 设置为主 WAN：
-
-```sh
-hitwh-mwan set-main 02:11:22:33:44:51
-```
-
-加入另外两个已认证 MAC：
-
-```sh
-hitwh-mwan add 02:11:22:33:44:52
-hitwh-mwan add 02:11:22:33:44:53
-```
-
-查看结果：
-
-```sh
-hitwh-mwan list
-```
-
-预期输出类似：
-
-```text
-active_count:3
-active_interfaces: wan wan2 wan3
-wan  ... state=active mark=0x101
-wan2 ... state=active mark=0x102
-wan3 ... state=active mark=0x103
-```
-
-`state=inactive` 通常表示该 MAC 尚未完成无感知认证；`state=no-dhcp` 表示墙口没有为它返回 DHCP 租约。
-
-## 后续扩展与管理
-
-添加一个新的已认证 MAC：
-
-```sh
-hitwh-mwan add AA:BB:CC:DD:EE:FF
-```
-
-脚本会自动选择下一个 `wanN`，创建 macvlan、申请 DHCP、加入防火墙和均衡池。默认最多支持 16 条线路，包括主 WAN。
-
-```sh
-# 查看并重新检查全部线路，不重启接口
-hitwh-mwan list
-
-# 检查并重连离线线路；在线线路不会中断
-hitwh-mwan refresh
-
-# 修改已有线路的 MAC，保留接口编号、路由表和分流标记
-hitwh-mwan edit wan2 02:11:22:33:44:62
-hitwh-mwan edit wan 02:11:22:33:44:61
-
-# 删除一条线路，三种写法均可
-hitwh-mwan remove wan4
-hitwh-mwan remove 4
-hitwh-mwan remove AA:BB:CC:DD:EE:FF
-
-# 观察墙口真实接收速度；按 Ctrl+C 停止
-hitwh-mwan speed
-
-# 观察 30 秒
-hitwh-mwan speed 30
-```
-
-`edit` 接受主接口名 `wan`（或配置的 `main_interface`）、`wan1`/`1`、副接口名 `wanN`、编号或已有副 WAN 的 MAC；例如 `hitwh-mwan edit 2 新MAC` 与 `edit wan2 新MAC` 等价。新 MAC 使用带冒号的六组十六进制格式，大小写均可；必须提前完成校园网认证，并且不能被另一条 WAN 使用。脚本拒绝全零、组播 MAC 和非受管接口（包括保留的 `wan6`）。配置与网卡实际 MAC 均已匹配时不会触发重连，`set-main 新MAC` 也使用同样的检查。
-
-修改前会备份网络配置，随后重连目标接口并重新检查线路。该线路的既有连接会中断；修改主 WAN 时，共享物理父设备的副线路也可能短暂受影响。没有 DHCP 或尚未认证时，命令会显示 `no-dhcp` 或 `inactive`；修改 MAC 本身不会代替校园网登录。
-
-主 WAN 的设备配置与接口配置会同步修改，包括名为 `wanphys` 或匿名的既有设备节；没有对应设备节时创建 `hitwh_main_device`。命令检查 `/sys/class/net/设备名/address` 中的实际 MAC：只有配置与实际设备都匹配时才跳过重连；若重连后实际 MAC 没有变成目标值，则报错，不把仅写入配置视为成功。
-
-## 本地可视化监控
-
-仓库中的 `dashboard` 是一个不依赖第三方 Python 包的本地网页仪表盘。它通过一条持久 SSH 连接，每 2 秒读取一次路由器已有的状态文件、网卡字节计数和系统负载；浏览器关闭、切到后台或点击暂停后会停止采样。路由器不运行 Web 服务，也不会执行测速。
-
-运行前需要安装 Python 3.10 或更高版本，并确保 `ssh` 可用；macOS/Linux 的启动脚本使用 `python3`，Windows 的启动脚本使用 `python`。先运行 `ssh root@192.168.100.1` 确认密钥登录正常。OpenWrt 的 Dropbear 使用 `/etc/dropbear/authorized_keys` 保存 root 的授权公钥。
-
-启动脚本启用 Python 的 UTF-8 模式，确保中文提示在英文系统和重定向输出时也能正常显示。SSH 采样脚本统一使用 UTF-8 与 LF 换行发送，避免 Windows 的 CRLF 导致远端 `sh` 报语法错误。仓库通过 `.gitattributes` 保持文本文件的 LF 换行；GitHub Actions 在 Linux、macOS、Windows 上运行回归测试并检查各自的启动脚本。
-
-macOS 或 Linux：
-
-```sh
-./dashboard/start.command
-```
-
-Windows PowerShell：
-
-```powershell
-.\dashboard\start.ps1
-```
-
-也可以直接运行：
-
-```sh
-python3 -X utf8 dashboard/server.py --router root@192.168.100.1
-```
-
-仪表盘默认只监听本机 `127.0.0.1:8765`，并自动打开浏览器。它使用现有 SSH 密钥或 SSH Agent，不保存路由器密码。页面显示总下载/上传、每条线路的实时速度和占比、在线状态、CPU、内存及连接跟踪使用量。
-
-## specific：具体下载器的多路优化
-
-[`specific`](specific/README.md) 用于记录针对具体下载器的多路下载优化方案。下载器的协议、连接复用和并发策略会影响按连接负载均衡的效果；每个下载器使用独立目录，包含问题原因、适用版本、操作步骤、配套脚本、验证结果和恢复方法。
-
-当前方案：
-
-- [米哈游启动器](specific/mihoyo-launcher/README.md)：关闭隐藏的 HTTP/2 设置，使独立下载连接参与多 WAN 分流；已在六出口环境中验证提速。
-
-这些方案在下载器所在的电脑上单独应用，路由器安装脚本不会自动执行。欢迎将其他下载器的多路优化方式贡献到 `specific`，详见 [贡献指南](CONTRIBUTING.md)。
-
-## 性能边界
-
-- 每条线路约 5 MB/s 时，三路理论持续总量约 15 MB/s。
-- 所有虚拟线路共用一个千兆墙口，物理极限为 1 Gbit/s；实际 TCP 有效速度通常低于 125 MB/s。
-- RAX3000M 使用双核 Cortex-A53。为了保证策略路由，项目关闭流量分载；线路很多、总流量达到数百 Mbit/s 后，CPU 软件 NAT 可能先成为瓶颈。
-- 校园网还可能限制单墙口总带宽、允许的 MAC 数、DHCP 租约数或账号在线设备数。
-- 限速器的启动瞬时突发不能变成持续带宽。长期速度仍取决于每个认证终端的稳定限速之和。
-
-更多解释见 [原理与性能边界](docs/principles.md)。遇到问题请看 [故障排查](docs/troubleshooting.md)。
-
-## 卸载
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ponder-j/hitwh-dorm-multiwan/main/uninstall.sh -o /tmp/uninstall.sh
-sh /tmp/uninstall.sh
-```
-
-卸载器只删除本项目创建的 `wan2`–`wanN` 与脚本，保留主 WAN 的 MAC。配置备份保存在 `/root/hitwh-mwan-backups/`。
-
-## 安全与隐私
-
-- 项目不需要校园网账号、密码，也不会自动提交认证表单。
-- 不要把 `/etc/config/network` 直接上传到 Issue，其中可能含固件向导遗留的敏感字段。
-- 示例、日志和 Issue 中应遮盖账号、真实 MAC、认证 URL 参数与内网地址。
-- 只添加本人或明确获授权使用的认证终端。
-
-## 开发检查
+## 开发与验证
 
 ```sh
 make check
+make ipk
 ```
+
+Windows 可分别运行 Python 测试及 `python tools/build_ipk.py`；POSIX 权限、信号和锁测试在 Linux/WSL 中验证。`dashboard/server.py` 保留为可选的电脑端 SSH 调试入口，发布 IPK 不包含它。
+
+构建与 CI 检查私有凭据文件和常见秘密字面量，CI 同时扫描可达 Git 历史和 IPK 内的脚本及页面；测试仅使用虚构凭据。发布前可执行 `python3 tests/check_secrets.py --history --ipk dist/*.ipk`。提交前检查可用 `git config core.hooksPath .githooks` 启用；macOS/Linux 需给钩子执行权限。
+
+IPK 使用 [OpenWrt 24.10 官方构建格式](https://github.com/openwrt/openwrt/blob/openwrt-24.10/scripts/ipkg-build)，管理接口采用 [rpcd 的原生 ucode 插件机制](https://lxr.openwrt.org/source/rpcd/examples/ucode/example-plugin.uc)。更多背景见 [工作原理](docs/principles.md)、[分流算法验证](docs/load-balancing.md) 和 [故障排查](docs/troubleshooting.md)。
 
 项目采用 [MIT License](LICENSE)。

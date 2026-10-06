@@ -14,6 +14,8 @@ STATUS_FILE=/tmp/hitwh-mwan.status
 MAX_PATHS="$(uci -q get hitwh_mwan.main.max_paths)"
 LAN_DEVICE="$(uci -q get hitwh_mwan.main.lan_device)"
 MAIN_INTERFACE="$(uci -q get hitwh_mwan.main.main_interface)"
+MAIN_ENROLLED="$(uci -q get hitwh_mwan.main.main_enrolled)"
+PARENT_DEVICE="$(uci -q get hitwh_mwan.main.parent_device)"
 HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
 HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
 FALLBACK_GATEWAY="$(uci -q get hitwh_mwan.main.gateway)"
@@ -24,6 +26,8 @@ ROUTER_FAILOVER="$(uci -q get hitwh_mwan.main.router_failover)"
 [ -n "$MAX_PATHS" ] || MAX_PATHS=17
 [ -n "$LAN_DEVICE" ] || LAN_DEVICE=br-lan
 [ -n "$MAIN_INTERFACE" ] || MAIN_INTERFACE=wan
+[ -n "$MAIN_ENROLLED" ] || MAIN_ENROLLED=1
+[ -n "$PARENT_DEVICE" ] || PARENT_DEVICE=eth1
 [ -n "$HEALTH_URL" ] || HEALTH_URL=http://connectivitycheck.gstatic.com/generate_204
 [ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
 [ -n "$ROUTER_FAILOVER" ] || ROUTER_FAILOVER=1
@@ -197,25 +201,46 @@ setup_path() {
 	TABLE=$((100 + N))
 	MARK="$(printf '0x%x' "$((0x100 + N))")"
 	MAC="$(cat "/sys/class/net/$DEV/address" 2>/dev/null)"
+	PREFIX="$(iface_status "$IFACE" | jsonfilter -e '@["ipv4-address"][0].mask' 2>/dev/null)"
+	# Older ubus fixtures/firmware omitted mask. Actual DHCP supplies it.
+	[ -n "$PREFIX" ] || PREFIX=16
+	SUBNET="$(awk -v ip="$IP" -v prefix="$PREFIX" 'BEGIN {
+	  if(prefix<0 || prefix>32 || split(ip,a,".")!=4) exit 1
+	  for(i=1;i<=4;i++) { bits=prefix-(i-1)*8; if(bits<0)bits=0; if(bits>8)bits=8;
+	    unit=2^(8-bits); a[i]=int(a[i]/unit)*unit }
+	  printf "%d.%d.%d.%d/%d",a[1],a[2],a[3],a[4],prefix
+	}')" || return 1
+	PATH_GATEWAY="$(iface_status "$IFACE" | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)"
+	[ -n "$PATH_GATEWAY" ] || PATH_GATEWAY="$GATEWAY"
 
 	ensure_guard "$TABLE" || return 1
 	# The campus subnet route also makes the shared gateway reachable.
-	if ! route_matches "$TABLE" "10.240.0.0/16" '' "$DEV" "$IP"; then
-		ip -4 route replace table "$TABLE" "10.240.0.0/16" dev "$DEV" src "$IP" || return 1
+	if ! route_matches "$TABLE" "$SUBNET" '' "$DEV" "$IP"; then
+		ip -4 route replace table "$TABLE" "$SUBNET" dev "$DEV" src "$IP" || return 1
 	fi
-	if ! route_matches "$TABLE" default "$GATEWAY" "$DEV" "$IP"; then
-		ip -4 route replace table "$TABLE" default via "$GATEWAY" dev "$DEV" src "$IP" || return 1
+	if ! route_matches "$TABLE" default "$PATH_GATEWAY" "$DEV" "$IP"; then
+		ip -4 route replace table "$TABLE" default via "$PATH_GATEWAY" dev "$DEV" src "$IP" || return 1
 	fi
 	ensure_rule "$((1000 + TABLE))" from all fwmark "$MARK/0xfff" lookup "$TABLE" || return 1
 	ensure_rule "$((1100 + TABLE))" from "$IP" lookup "$TABLE" || return 1
 	echo "$N|$IFACE|$DEV|$IP|$TABLE|$MARK|$MAC" >>"$PATHFILE"
 }
 
-setup_path 1 "$MAIN_INTERFACE" || true
+if [ "$MAIN_ENROLLED" != 0 ]; then
+	setup_path 1 "$MAIN_INTERFACE" || true
+elif ip -4 route show table 101 exact default 2>/dev/null | grep -q '^default via '; then
+	# Withdraw a legacy enrolled main path without taking down the shared parent.
+	ip -4 route replace unreachable default table 101 metric 0 || exit 1
+fi
 N=2
 while [ "$N" -le "$MAX_PATHS" ]; do
 	if [ "$N" -eq 6 ]; then N=$((N + 1)); continue; fi
-	uci -q get "network.wan$N" >/dev/null && setup_path "$N" "wan$N" || true
+	if [ "$(uci -q get "network.wan${N}dev.type")" = macvlan ] &&
+		[ "$(uci -q get "network.wan${N}dev.ifname")" = "$PARENT_DEVICE" ] &&
+		[ "$(uci -q get "network.wan$N.device")" = "macwan$N" ] &&
+		[ "$(uci -q get "network.wan$N.proto")" = dhcp ]; then
+		setup_path "$N" "wan$N" || true
+	fi
 	N=$((N + 1))
 done
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+if [ -f /tmp/hitwh-mwan-install/config ] && [ ! -L /tmp/hitwh-mwan-install ] &&
+    [ "$(stat -c '%u:%a' /tmp/hitwh-mwan-install)" = 0:700 ]; then
+    cp /tmp/hitwh-mwan-install/config /etc/config/hitwh_mwan
+fi
+rm -f /tmp/hitwh-mwan-install/config
+rmdir /tmp/hitwh-mwan-install 2>/dev/null || true
+/usr/libexec/hitwh-mwan-setup

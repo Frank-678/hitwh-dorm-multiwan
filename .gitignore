@@ -2,3 +2,15 @@
 *.swp
 *.tmp
 __pycache__/
+auth.d/
+*.credentials.json
+config.toml
+mac-history
+dist/
+*.ipk
+.env
+.env.*
+!.env.example
+*.log
+id_rsa
+id_ed25519

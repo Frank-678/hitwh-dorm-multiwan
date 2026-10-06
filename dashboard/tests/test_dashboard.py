@@ -1,9 +1,12 @@
 import importlib.util
+import http.client
+import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from unittest import mock
@@ -43,6 +46,81 @@ DEV\twan2\tmacwan2\t450000\t140000
 
 
 class DashboardTests(unittest.TestCase):
+    def test_native_rpc_credentials_stay_on_stdin(self):
+        collector=SERVER.RouterCollector('root@router',2.0)
+        values={"action":"add-random","username":"fake-user","password":"fake-secret &账"}
+        result=subprocess.CompletedProcess([],0,stdout=b'{"ok":true,"job":"ABC123"}',stderr=b'')
+        with mock.patch.object(SERVER.subprocess,'run',return_value=result) as run:
+            self.assertTrue(collector.native_rpc('start',values)['ok'])
+        self.assertNotIn(values['password'],repr(run.call_args.args))
+        self.assertEqual(json.loads(run.call_args.kwargs['input']),values)
+
+    def test_native_job_polls_one_id_without_resubmitting_login(self):
+        collector=SERVER.RouterCollector('root@router',2.0)
+        with mock.patch.object(collector,'native_rpc',side_effect=[
+            {'ok':True,'job':'ABC123'},{'ok':True,'state':'running'},{'ok':True,'state':'done','message':'完成'}]) as rpc, \
+            mock.patch.object(SERVER.time,'sleep'),mock.patch.object(collector,'touch'):
+            self.assertTrue(collector.router_action({'action':'refresh','interface':'wan3'})['ok'])
+        self.assertEqual([call.args[0] for call in rpc.call_args_list],['start','job','job'])
+        self.assertEqual(rpc.call_args_list[1].args[1],{'id':'ABC123'})
+        self.assertEqual(rpc.call_args_list[2].args[1],{'id':'ABC123'})
+
+    def test_credential_payload_uses_stdin_and_is_not_cached(self):
+        collector = SERVER.RouterCollector("root@router", 2.0)
+        values = {"username": "fake-user", "password": "fake-secret &账"}
+        completed = subprocess.CompletedProcess([], 0, stdout=b"AUTH_RESULT wan saved\n", stderr=b"")
+        with mock.patch.object(SERVER.subprocess, "run", return_value=completed) as run:
+            ok, result = collector.credentials("save", "wan", values)
+        self.assertTrue(ok)
+        self.assertNotIn(values["password"], repr(run.call_args.args))
+        self.assertEqual(json.loads(run.call_args.kwargs["input"]), values)
+        self.assertNotIn(values["password"], repr(collector.__dict__) + repr(result))
+
+    def test_credentials_require_valid_identifiers_and_do_not_echo_errors(self):
+        collector = SERVER.RouterCollector("root@router", 2.0)
+        with mock.patch.object(SERVER.subprocess, "run") as run:
+            self.assertFalse(collector.credentials("get", "wan;echo injected", {})[0])
+            self.assertFalse(collector.credentials("save", "wan", {"username": "fake-user", "password": ""})[0])
+            run.assert_not_called()
+        completed = subprocess.CompletedProcess([], 1, stdout=b"fake-secret echoed", stderr=b"fake-secret")
+        with mock.patch.object(SERVER.subprocess, "run", return_value=completed):
+            self.assertNotIn("fake-secret", repr(collector.credentials("get", "wan", {})))
+
+    def test_saved_metadata_never_includes_credentials(self):
+        sample = SERVER.RateCalculator().transform(SERVER.parse_frame([*FRAME_ONE, "AUTHCFG\twan\t1"]))
+        self.assertTrue(sample["paths"][0]["credentials_saved"])
+        self.assertNotIn("password", json.dumps(sample))
+
+    def test_credential_http_requires_explicit_same_origin_post(self):
+        collector = mock.Mock()
+        collector.credentials.return_value = (True, {"configured": False})
+        handler = type("TestHandler", (SERVER.DashboardHandler,), {"collector": collector})
+        httpd = SERVER.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        host = f"127.0.0.1:{httpd.server_port}"
+        body = json.dumps({"action": "get", "interface": "wan"})
+        def request(method="POST", headers=None, payload=body):
+            connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=5)
+            connection.request(method, "/api/credentials", payload, headers or {})
+            response = connection.getresponse()
+            status, cache, data = response.status, response.getheader("Cache-Control"), response.read()
+            connection.close()
+            return status, cache, data
+        headers = {"Content-Type": "application/json", "X-Dashboard-Action": "credentials"}
+        self.assertEqual(request("GET")[0], 404)
+        self.assertEqual(request(headers={"Content-Type": "application/json"})[0], 403)
+        self.assertEqual(request(headers={**headers, "Origin": "http://attacker.invalid"})[0], 403)
+        self.assertEqual(request(headers={**headers, "Host": "attacker.invalid"})[0], 403)
+        self.assertEqual(request(headers=headers, payload="[]")[0], 400)
+        collector.credentials.assert_not_called()
+        status, cache, data = request(headers={**headers, "Origin": f"http://{host}"})
+        self.assertEqual((status, cache), (200, "no-store"))
+        self.assertTrue(json.loads(data)["ok"])
+        collector.credentials.assert_called_once()
+
     def test_launcher_prints_utf8_help_with_legacy_locale(self):
         if os.name == "nt":
             command = [
@@ -140,7 +218,7 @@ class DashboardTests(unittest.TestCase):
             ],
             input=SERVER.RECONNECT_SCRIPT.encode("utf-8"),
             capture_output=True,
-            timeout=75,
+            timeout=SERVER.REFRESH_TIMEOUT,
         )
         touch.assert_called_once_with()
 

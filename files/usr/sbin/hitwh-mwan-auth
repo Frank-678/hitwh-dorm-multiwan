@@ -1,0 +1,253 @@
+#!/bin/sh
+
+# Secrets are data, never shell code, exported variables, or process arguments.
+set +x
+set +a
+unset AUTH_USER_VALUE AUTH_PASS_VALUE
+umask 077
+AUTH_DIR="${HITWH_MWAN_AUTH_DIR:-/etc/hitwh-mwan/auth.d}"
+AUTH_BASE="$(dirname "$AUTH_DIR")"
+WORK=""
+ECHO_OFF=0
+cleanup() {
+	[ "$ECHO_OFF" = 0 ] || stty echo </dev/tty 2>/dev/null
+	[ -z "$WORK" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+fail() { printf 'AUTH_RESULT %s %s\n' "${IFACE:-unknown}" "$1"; exit 1; }
+[ "$(id -u)" = 0 ] || fail root_required
+
+MAIN="$(uci -q get hitwh_mwan.main.main_interface)"
+PARENT="$(uci -q get hitwh_mwan.main.parent_device)"
+MAX="$(uci -q get hitwh_mwan.main.max_paths)"
+[ -n "$MAIN" ] || MAIN=wan
+[ -n "$PARENT" ] || PARENT=eth1
+[ -n "$MAX" ] || MAX=17
+ACTION="$1"
+IFACE="$2"
+case "$ACTION" in prepare|prepare-import) IFACE="$MAIN" ;; esac
+
+case "$IFACE" in ''|*[!a-zA-Z0-9_-]*) fail invalid_interface ;; esac
+if [ "$IFACE" = "$MAIN" ]; then
+	uci -q get "network.$IFACE" >/dev/null || fail invalid_interface
+	DEV="$(uci -q get "network.$IFACE.device")"
+	[ -n "$DEV" ] || DEV="$PARENT"
+	CONFIG_MAC="$(uci -q get "network.$IFACE.macaddr")"
+else
+	case "$IFACE" in wan[1-9]*) SLOT="${IFACE#wan}" ;; *) fail invalid_interface ;; esac
+	case "$SLOT" in 0*|*[!0-9]*) fail invalid_interface ;; esac
+	[ "$SLOT" -ge 2 ] && [ "$SLOT" -le "$MAX" ] && [ "$SLOT" -ne 6 ] || fail invalid_interface
+	[ "$(uci -q get "network.wan${SLOT}dev.type")" = macvlan ] &&
+	[ "$(uci -q get "network.wan${SLOT}dev.ifname")" = "$PARENT" ] &&
+	[ "$(uci -q get "network.$IFACE.device")" = "macwan$SLOT" ] &&
+	[ "$(uci -q get "network.$IFACE.proto")" = dhcp ] || fail invalid_interface
+	DEV="macwan$SLOT"
+	CONFIG_MAC="$(uci -q get "network.wan${SLOT}dev.macaddr")"
+fi
+MAC="$(cat "/sys/class/net/$DEV/address" 2>/dev/null)"
+MAC="$(printf '%s' "${MAC:-$CONFIG_MAC}" | tr 'A-F' 'a-f')"
+FILE="$AUTH_DIR/$IFACE.json"
+
+private_dir() { [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c '%u:%a' "$1")" = 0:700 ]; }
+check_dirs() {
+	private_dir "$AUTH_BASE" && private_dir "$AUTH_DIR" || fail insecure_storage
+}
+check_file() {
+	check_dirs
+	[ ! -L "$FILE" ] && [ -f "$FILE" ] && [ "$(stat -c '%u:%a' "$FILE")" = 0:600 ] || fail insecure_storage
+}
+make_dirs() {
+	[ ! -L "$AUTH_BASE" ] && [ ! -L "$AUTH_DIR" ] || fail insecure_storage
+	[ -e "$AUTH_BASE" ] || mkdir -m 700 "$AUTH_BASE" || fail storage_failed
+	[ -e "$AUTH_DIR" ] || mkdir -m 700 "$AUTH_DIR" || fail storage_failed
+	check_dirs
+	[ ! -e "$FILE" ] && [ ! -L "$FILE" ] || check_file
+}
+new_work() { WORK="$(mktemp -d "${TMPDIR:-/tmp}/hitwh-mwan-auth.XXXXXX")" || fail storage_failed; }
+field() { jsonfilter -i "$1" -e "@.$2" 2>/dev/null; }
+read_credential_values() {
+	# Validate decoded bytes before shell command substitution can strip a
+	# trailing newline or NUL. jsonfilter adds exactly one output newline.
+	for KEY in username password; do
+		field "$1" "$KEY" >"$WORK/$KEY" || fail invalid_credentials
+		CONTROL_COUNT="$(LC_ALL=C tr -d '\040-\176\200-\377' <"$WORK/$KEY" | wc -c)"
+		[ "$CONTROL_COUNT" -eq 1 ] || fail invalid_credentials
+	done
+	AUTH_USER_VALUE="$(cat "$WORK/username")"
+	AUTH_PASS_VALUE="$(cat "$WORK/password")"
+}
+json_string() {
+	printf '%s' "$1" | LC_ALL=C awk '
+	BEGIN { printf "\""; for (i=1;i<32;i++) control[sprintf("%c",i)]=i }
+	{ if (NR>1) printf "\\n"; for (i=1;i<=length($0);i++) {
+	  c=substr($0,i,1)
+	  if (c=="\\") printf "\\\\"; else if(c=="\"") printf "\\\""
+	  else if(c in control) printf "\\u%04x",control[c]; else printf "%s",c
+	} }
+	END { printf "\"" }'
+}
+validate_values() {
+	[ -n "$AUTH_USER_VALUE" ] && [ -n "$AUTH_PASS_VALUE" ] &&
+	[ "${#AUTH_USER_VALUE}" -le 1024 ] && [ "${#AUTH_PASS_VALUE}" -le 2048 ] || fail invalid_credentials
+	printf '%s%s' "$AUTH_USER_VALUE" "$AUTH_PASS_VALUE" | LC_ALL=C grep -q '[[:cntrl:]]' && fail invalid_credentials
+	printf '%s' "$MAC" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || fail mac_unavailable
+}
+write_values() {
+	{
+		printf '{"username":'; json_string "$AUTH_USER_VALUE"
+		printf ',"password":'; json_string "$AUTH_PASS_VALUE"
+		printf ',"mac":'; json_string "$MAC"; printf '}\n'
+	} >"$WORK/value.json" || fail storage_failed
+	chmod 600 "$WORK/value.json" || fail storage_failed
+}
+read_values() {
+	[ -r /dev/tty ] || fail terminal_required
+	printf 'Username: ' >/dev/tty
+	IFS= read -r AUTH_USER_VALUE </dev/tty || fail input_cancelled
+	printf 'Password (hidden): ' >/dev/tty
+	stty -echo </dev/tty || fail terminal_required
+	ECHO_OFF=1
+	IFS= read -r AUTH_PASS_VALUE </dev/tty || fail input_cancelled
+	stty echo </dev/tty; ECHO_OFF=0; printf '\n' >/dev/tty
+	validate_values
+}
+save_values() {
+	validate_values
+	# The temporary credential file lives on the same private filesystem.
+	WORK="$(mktemp -d "$AUTH_DIR/.write.XXXXXX")" || fail storage_failed
+	write_values
+	mv -f "$WORK/value.json" "$FILE" || fail storage_failed
+	printf 'AUTH_RESULT %s saved\n' "$IFACE"
+}
+
+case "$ACTION" in
+	status)
+		if [ ! -e "$FILE" ] && [ ! -L "$FILE" ]; then
+			printf '{"interface":"%s","configured":false}\n' "$IFACE"
+		else
+			check_file
+			printf '{"interface":"%s","configured":true}\n' "$IFACE"
+		fi
+		exit 0 ;;
+	get)
+		if [ ! -e "$FILE" ] && [ ! -L "$FILE" ]; then printf '{"configured":false}\n'; exit 0; fi
+		check_file
+		cat "$FILE"
+		exit 0 ;;
+	remove)
+		if [ -e "$FILE" ] || [ -L "$FILE" ]; then check_file; rm -f "$FILE" || fail storage_failed; fi
+		printf 'AUTH_RESULT %s removed\n' "$IFACE"; exit 0 ;;
+	set)
+		make_dirs
+		read_values
+		save_values; exit 0 ;;
+	prepare)
+		# Internal add-random handoff. Only the private pathname is returned.
+		make_dirs
+		WORK="$(mktemp -d "$AUTH_DIR/.pending.XXXXXX")" || fail storage_failed
+		read_values
+		write_values
+		printf '%s\n' "$WORK"
+		WORK=""; exit 0 ;;
+	prepare-import)
+		# Explicit GUI/IPC input; credentials never become process arguments.
+		make_dirs
+		WORK="$(mktemp -d "$AUTH_DIR/.pending.XXXXXX")" || fail storage_failed
+		head -c 8193 >"$WORK/input.json"
+		[ "$(wc -c <"$WORK/input.json")" -le 8192 ] || fail invalid_credentials
+		read_credential_values "$WORK/input.json"
+		validate_values
+		write_values
+		rm -f "$WORK/input.json" "$WORK/username" "$WORK/password"
+		printf '%s\n' "$WORK"
+		WORK=""; exit 0 ;;
+	import)
+		make_dirs
+		new_work
+		head -c 8193 >"$WORK/input.json"
+		[ "$(wc -c <"$WORK/input.json")" -le 8192 ] || fail invalid_credentials
+		read_credential_values "$WORK/input.json"
+		rm -rf "$WORK"; WORK=""
+		save_values; exit 0 ;;
+	discover) ;;
+	login) ;;
+	*) fail invalid_action ;;
+esac
+
+get_ip() { ubus call "network.interface.$IFACE" status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null; }
+IP="$(get_ip)"
+[ -n "$IP" ] || fail no_dhcp
+if [ "$ACTION" = login ]; then
+	[ -e "$FILE" ] || fail missing_credentials
+	check_file
+	[ "$(field "$FILE" mac)" = "$MAC" ] || fail mac_mismatch
+fi
+HEALTH_URL="$(uci -q get hitwh_mwan.main.health_url)"
+HEALTH_CODE="$(uci -q get hitwh_mwan.main.health_code)"
+PORTAL="$(uci -q get hitwh_mwan.main.portal_url)"
+[ -n "$HEALTH_URL" ] || HEALTH_URL=http://connectivitycheck.gstatic.com/generate_204
+[ -n "$HEALTH_CODE" ] || HEALTH_CODE=204
+[ -n "$PORTAL" ] || PORTAL=http://172.26.156.158/eportal
+PORTAL="${PORTAL%/}"
+case "$PORTAL" in http://*|https://*) ;; *) fail invalid_portal ;; esac
+new_work
+
+request() {
+	curl -4 --noproxy '*' -sS --interface "$IP" --connect-timeout 3 --max-time 5 \
+		--max-filesize 65536 "$@" 2>/dev/null
+}
+CODE="$(request -D "$WORK/headers" -o "$WORK/health" -w '%{http_code}' "$HEALTH_URL")" || fail network_error
+[ "$CODE" != "$HEALTH_CODE" ] || { printf 'AUTH_RESULT %s already_online\n' "$IFACE"; exit 0; }
+URL="$(sed -n "s/.*location.href=['\"]\([^'\"]*\)['\"].*/\1/p" "$WORK/health")"
+[ -n "$URL" ] || URL="$(awk 'tolower($0) ~ /^location:/ {sub(/^[^:]*:[ \t]*/,"");sub(/\r$/,"");print;exit}' "$WORK/headers")"
+if [ "$ACTION" = discover ]; then
+	DISCOVERED="${URL%%/index.jsp\?*}"
+	printf '%s' "$DISCOVERED" | grep -Eq '^https?://[^/@?#[:space:]]+(/[^?#[:space:]]*)?/eportal$' || fail portal_not_detected
+	printf '{"portal_url":'; json_string "$DISCOVERED"; printf '}\n'
+	exit 0
+fi
+case "$URL" in "$PORTAL/index.jsp?"*) ;; *) fail portal_not_detected ;; esac
+# Remove the literal first question mark, not a shell '?' wildcard.
+QUERY="${URL#*\?}"
+url_encode() {
+	printf '%s' "$1" | hexdump -v -e '1/1 "%02X "' | awk '
+	{ for(i=1;i<=NF;i++) {
+	  digits="0123456789ABCDEF"; h=$i
+	  n=(index(digits,substr(h,1,1))-1)*16+index(digits,substr(h,2,1))-1
+	  if((n>=65&&n<=90)||(n>=97&&n<=122)||(n>=48&&n<=57)||n==45||n==46||n==95||n==126)
+	    printf "%c",n; else printf "%%%s",h
+	} }'
+}
+ENCODED_QUERY="$(url_encode "$QUERY")"
+printf 'queryString=%s' "$ENCODED_QUERY" |
+	request -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+	--data-binary @- -o "$WORK/page" "$PORTAL/InterFace.do?method=pageInfo" || fail network_error
+ENCRYPT="$(field "$WORK/page" passwordEncrypt)"
+case "$ENCRYPT" in false) ;; true) fail encryption_required ;; *) fail invalid_response ;; esac
+[ -z "$(field "$WORK/page" validCodeUrl)" ] || fail captcha_required
+[ "$(field "$WORK/page" isValidateCode)" != true ] || fail captcha_required
+request --data-binary '' -o "$WORK/services" \
+	"$PORTAL/InterFace.do?method=getServices&queryString=$ENCODED_QUERY" || fail network_error
+[ "$(field "$WORK/services" isService)" = false ] || fail service_required
+
+[ "$(get_ip)" = "$IP" ] || fail address_changed
+cp "$FILE" "$WORK/credentials.json" || fail storage_failed
+[ "$(field "$WORK/credentials.json" mac)" = "$MAC" ] || fail mac_mismatch
+[ "$(cat "/sys/class/net/$DEV/address" 2>/dev/null | tr 'A-F' 'a-f')" = "$MAC" ] || fail mac_mismatch
+read_credential_values "$WORK/credentials.json"
+validate_values
+{
+	printf 'userId='; url_encode "$(url_encode "$AUTH_USER_VALUE")"
+	printf '&password='; url_encode "$(url_encode "$AUTH_PASS_VALUE")"
+	printf '&service=&queryString='; url_encode "$ENCODED_QUERY"
+	printf '&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=false'
+} | request -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+	--data-binary @- -o "$WORK/result" "$PORTAL/InterFace.do?method=login" || fail network_error
+[ "$(field "$WORK/result" result)" = success ] || fail authentication_failed
+[ "$(get_ip)" = "$IP" ] || fail address_changed
+CODE="$(request -o /dev/null -w '%{http_code}' "$HEALTH_URL")" || fail network_error
+[ "$CODE" = "$HEALTH_CODE" ] || fail verification_failed
+printf 'AUTH_RESULT %s success\n' "$IFACE"
