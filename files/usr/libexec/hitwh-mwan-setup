@@ -3,7 +3,7 @@
 set -eu
 umask 077
 [ "$(id -u)" = 0 ] || exit 1
-for CMD in uci ubus jsonfilter nft ip curl fw4 stat hexdump flock ucode; do
+for CMD in uci ubus jsonfilter nft ip curl fw4 stat hexdump flock ucode sha256sum tar setsid; do
     command -v "$CMD" >/dev/null 2>&1 || { echo "Missing required runtime: $CMD" >&2; exit 1; }
 done
 [ ! -L /etc/hitwh-mwan ] && [ ! -L /etc/hitwh-mwan/auth.d ] || exit 1
@@ -51,5 +51,5 @@ fi
 /etc/init.d/hitwh-mwan start
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 rm -rf /tmp/luci-modulecache
-/etc/init.d/rpcd restart
+[ "${HITWH_MWAN_IN_APP_UPGRADE:-}" = 1 ] || /etc/init.d/rpcd restart
 echo 'Installed. Open LuCI: Network -> 多路合并管理器. No authentication was submitted.'

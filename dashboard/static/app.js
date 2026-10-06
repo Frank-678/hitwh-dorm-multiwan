@@ -24,6 +24,18 @@ const authMessages = {
 };
 
 function resultMessage(result) {
+  if (result.upgrade) {
+    const u = result.upgrade;
+    if (u.code === 'installed') return `已更新至 ${u.latest}，请刷新页面；管理连接稍后重载，可能需要重新登录。`;
+    if (u.code === 'no_update') return `没有可安装的新版本（当前 ${u.current}，GitHub 最新 ${u.latest}）`;
+    const reasons = {busy:'另一项线路操作正在进行，请稍后重试',check_failed:'无法连接 GitHub，请检查网络后重试',
+      download_failed:'更新文件下载失败，请重试',verification_failed:'更新文件校验失败，未安装',
+      invalid_release:'发布附件或版本信息不完整，未安装',incompatible_firmware:'此固件不在支持范围内',
+      incompatible_package:'更新包与当前 OpenWrt 不兼容，未安装',insufficient_space:'剩余存储空间不足 4 MiB，未安装',
+      dependency_failed:'更新依赖检查失败，未安装',install_failed:'安装未完成，请检查软件包状态',
+      component_missing:'缺少更新组件，请先离线安装最新版 IPK',package_missing:'无法读取已安装版本',interrupted:'更新已中断'};
+    return reasons[u.code] || '更新检查失败，请检查网络和软件包状态';
+  }
   const errors = (result.details || []).filter(item => authMessages[item.code]).map(item => `${item.interface}：${authMessages[item.code]}`);
   if (result.retained) return `${result.interface || "新线路"} 已保留，当前离线。${errors.join("；") || "请修正凭据后手动刷新"}`;
   if (errors.length) return errors.join("；");
@@ -58,6 +70,7 @@ function nativePayload(result) {
     total:{rx_bytes_per_second:paths.reduce((s,p)=>s+p.rx_bytes_per_second,0),tx_bytes_per_second:paths.reduce((s,p)=>s+p.tx_bytes_per_second,0)}};
   state.previousRaw = raw;
   state.nativeSettings = result.settings;
+  state.packageVersion = result.package_version;
   state.history.push({timestamp:raw.timestamp,rx_bytes_per_second:sample.total.rx_bytes_per_second,
     paths:Object.fromEntries(paths.map(p=>[p.interface,p.rx_bytes_per_second]))});
   if (state.history.length > 180) state.history.shift();
@@ -66,7 +79,7 @@ function nativePayload(result) {
 
 function operationBusy(busy) {
   state.busy = busy;
-  for (const button of document.querySelectorAll("#add-button, #settings-button, #reconnect-button, .path-actions button")) button.disabled = busy;
+  for (const button of document.querySelectorAll("#add-button, #settings-button, #upgrade-button, #reconnect-button, .path-actions button")) button.disabled = busy;
 }
 
 async function perform(path, values) {
@@ -379,14 +392,89 @@ async function reconnectPaths(interfaceName = "") {
 
 $("#reconnect-button").addEventListener("click", () => reconnectPaths());
 
+$('#upgrade-button').addEventListener('click', async () => {
+  if (state.busy) return;
+  const button = $('#upgrade-button'), status = $('#upgrade-status');
+  operationBusy(true); button.textContent = '检查并更新中…'; status.hidden = false;
+  status.dataset.state = '';
+  status.textContent = '正在检查 GitHub；若有兼容新版本，将下载、校验并安装，请勿关闭路由器电源。';
+  try {
+    const result = await perform('/api/paths', {action:'upgrade'});
+    status.textContent = resultMessage(result);
+    status.dataset.state = result.ok ? 'success' : 'error';
+    if (result.upgrade?.code === 'installed') state.packageVersion = result.upgrade.latest;
+  } catch (error) {
+    status.dataset.state = 'error';
+    status.textContent = `${error.message || '更新请求失败'}。若管理连接中断，请重新登录后检查已安装版本。`;
+  } finally {operationBusy(false); button.textContent = '检查更新';}
+});
+
 let credentialInterface = "";
 let credentialGeneration = 0;
+const reuseGeneration = {credential:0, add:0};
+const reuseBusy = {credential:false, add:false};
 
-async function credentialRequest(action, values = {}) {
+function clearReuse(prefix) {
+  ++reuseGeneration[prefix];
+  const select = $("#" + prefix + "-source");
+  select.replaceChildren(new Option('手动输入账号密码', ''));
+  select.disabled = true;
+}
+
+async function loadCredentialChoices(prefix, current = '') {
+  clearReuse(prefix);
+  const generation = reuseGeneration[prefix];
+  const dialog = $(prefix === 'credential' ? '#credentials-dialog' : '#add-dialog');
+  try {
+    const result = await credentialRequest('choices', {}, '');
+    if (generation !== reuseGeneration[prefix] || !dialog.open) return;
+    for (const choice of result.choices || []) {
+      const sources = (choice.interfaces || [choice.interface]).filter(iface => iface !== current);
+      if (!sources.length) continue;
+      $("#" + prefix + "-source").add(new Option(`${choice.username}（${sources.join('、')}）`, sources[0]));
+    }
+    $("#" + prefix + "-source").disabled = reuseBusy[prefix] || $("#" + prefix + "-source").options.length <= 1;
+  } catch (error) {
+    if (generation === reuseGeneration[prefix] && dialog.open)
+      $("#" + prefix + "-source").options[0].textContent = '暂无法读取已有凭据，可手动输入';
+  }
+}
+
+function addCredentialBusy(busy) {
+  reuseBusy.add = busy;
+  for (const id of ['add-username','add-password','add-submit']) $("#"+id).disabled = busy;
+  $('#add-source').disabled = busy || $('#add-source').options.length <= 1;
+}
+
+for (const prefix of ['credential','add']) $("#"+prefix+"-source").addEventListener('change', async () => {
+  const select = $("#"+prefix+"-source"), source = select.value;
+  const generation = ++reuseGeneration[prefix];
+  const dialog = $(prefix === 'credential' ? '#credentials-dialog' : '#add-dialog');
+  const busy = prefix === 'credential' ? credentialBusy : addCredentialBusy;
+  const message = text => prefix === 'credential' ? credentialMessage(text) : $('#add-message').textContent = text;
+  if (!source) {busy(false); return;}
+  busy(true); message('正在读取所选凭据…');
+  try {
+    const result = await credentialRequest('get', {}, source);
+    if (generation !== reuseGeneration[prefix] || !dialog.open || select.value !== source) return;
+    if (!result.configured || !result.username || !result.password) throw new Error('所选凭据已不可用，请重新打开弹窗');
+    $("#"+prefix+"-username").value = result.username;
+    $("#"+prefix+"-password").value = result.password;
+    $("#"+prefix+"-password").type = 'password';
+    $("#"+prefix+"-visible").checked = false;
+    message(`已复用 ${source} 的凭据，可修改后${prefix === 'credential' ? '保存' : '添加线路'}。`);
+  } catch (error) {
+    if (generation === reuseGeneration[prefix] && dialog.open) {select.value=''; message(error.message || '读取凭据失败');}
+  } finally {
+    if (generation === reuseGeneration[prefix] && dialog.open) busy(false);
+  }
+});
+
+async function credentialRequest(action, values = {}, interfaceName = credentialInterface) {
   const response = await MwanAPI.request("/api/credentials", {
     method: "POST", cache: "no-store",
     headers: { "Content-Type": "application/json", "X-Dashboard-Action": "credentials" },
-    body: JSON.stringify({ action, interface: credentialInterface, ...values }),
+    body: JSON.stringify({ action, interface: interfaceName, ...values }),
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(resultMessage(result));
@@ -394,7 +482,9 @@ async function credentialRequest(action, values = {}) {
 }
 
 function credentialBusy(busy) {
+  reuseBusy.credential = busy;
   for (const id of ["credential-username", "credential-password", "credentials-save", "credentials-remove"]) $("#" + id).disabled = busy;
+  $('#credential-source').disabled = busy || $('#credential-source').options.length <= 1;
 }
 
 function credentialMessage(message, error = false) {
@@ -415,6 +505,7 @@ $("#path-list").addEventListener("click", async (event) => {
   credentialMessage("正在读取凭据…");
   credentialBusy(true);
   dialog.showModal();
+  const choices = loadCredentialChoices('credential', credentialInterface);
   try {
     const result = await credentialRequest("get");
     if (generation !== credentialGeneration || !dialog.open) return;
@@ -428,6 +519,7 @@ $("#path-list").addEventListener("click", async (event) => {
   } catch (error) {
     if (generation === credentialGeneration && dialog.open) credentialMessage(error.message || "无法读取凭据", true);
   } finally {
+    await choices;
     if (generation === credentialGeneration && dialog.open) {
       credentialBusy(false);
       $("#credential-username").focus();
@@ -439,6 +531,7 @@ $("#credential-visible").addEventListener("change", (event) => {
   $("#credential-password").type = event.target.checked ? "text" : "password";
 });
 function clearCredentialFields() {
+  clearReuse('credential');
   $("#credentials-form").reset();
   $("#credential-password").value = "";
   $("#credential-password").type = "password";
@@ -496,6 +589,7 @@ document.addEventListener("visibilitychange", () => {
 
 for (const button of document.querySelectorAll('[data-close]')) button.addEventListener('click', () => $("#" + button.dataset.close).close());
 for (const id of ['add-dialog','path-dialog','settings-dialog']) $("#"+id).addEventListener('close', () => {
+  if (id === 'add-dialog') clearReuse('add');
   $("#"+id).querySelector('form').reset();
   for (const input of $("#"+id).querySelectorAll('input[type="password"], #add-password')) {input.value='';input.type='password';}
 });
@@ -508,10 +602,12 @@ function addMode() {
   $("#add-username").required = random;
   $("#add-password").required = random;
   $("#add-submit").textContent = random ? '添加并认证' : '添加线路';
+  if (!random) {clearReuse('add'); addCredentialBusy(false); $('#add-username').value=''; $('#add-password').value='';}
+  else if ($('#add-dialog').open) loadCredentialChoices('add');
 }
 for (const input of document.querySelectorAll('input[name="mode"]')) input.addEventListener('change',addMode);
 $("#add-visible").addEventListener('change',e => {$("#add-password").type=e.target.checked?'text':'password';});
-$("#add-button").addEventListener('click', () => {$("#add-form").reset();$("#add-password").type='password';addMode();$("#add-message").textContent='';$("#add-dialog").showModal();});
+$("#add-button").addEventListener('click', () => {clearReuse('add'); addCredentialBusy(false); $("#add-form").reset();$("#add-password").type='password';addMode();$("#add-message").textContent='';$("#add-dialog").showModal();loadCredentialChoices('add');});
 $("#add-form").addEventListener('submit',async event => {
   event.preventDefault();
   const random = document.querySelector('input[name="mode"]:checked').value === 'random';

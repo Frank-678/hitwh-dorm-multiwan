@@ -444,7 +444,7 @@ class RouterCollector:
             self.reconnect_lock.release()
 
     def native_rpc(self, method: str, values: dict[str, Any]) -> dict[str, Any]:
-        if method not in {"snapshot", "settings", "start", "job"}:
+        if method not in {"snapshot", "settings", "start", "job", "credential_choices"}:
             return {"ok": False, "message": "无效操作"}
         code = ("import { stdin } from 'fs'; import { connect } from 'ubus'; "
                 f"print(sprintf('%J',connect().call('hitwh.mwan','{method}',json(stdin.read('all'))))); ")
@@ -463,7 +463,7 @@ class RouterCollector:
         if not result.get("ok"):
             return result
         job_id = result["job"]
-        deadline = time.monotonic() + 320
+        deadline = time.monotonic() + (480 if values.get("action") == "upgrade" else 320)
         while time.monotonic() < deadline:
             time.sleep(0.7)
             result = self.native_rpc("job", {"id": job_id})
@@ -479,6 +479,9 @@ class RouterCollector:
 
     def credentials(self, action: str, interface: str, values: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Only explicit dialog actions read secrets; no collector state caches them."""
+        if action == "choices":
+            result = self.native_rpc("credential_choices", {})
+            return bool(result.get("ok")), result
         if action not in {"get", "save", "remove"} or not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", interface):
             return False, {"message": "无效的凭据操作或接口"}
         payload = None

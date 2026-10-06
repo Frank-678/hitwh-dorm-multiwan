@@ -21,10 +21,12 @@
           <span id="refresh-status" class="refresh-status" role="status" aria-live="polite"></span>
         </div>
         <button id="settings-button" type="button">接入设置</button>
+        <button id="upgrade-button" type="button">检查更新</button>
         <button id="reconnect-button" type="button">刷新离线线路</button>
         <button id="add-button" class="primary-button" type="button">新增线路</button>
       </div>
     </header>
+    <p id="upgrade-status" class="dialog-message" role="status" aria-live="polite" hidden></p>
 
     <section class="metric-grid" aria-label="总览">
       <article class="metric primary">
@@ -82,6 +84,9 @@
         <button id="credentials-close" type="button" aria-label="关闭">×</button>
       </div>
       <p class="dialog-note">保存后点击该线路的“刷新”进行认证。掉线时不会自动登录。</p>
+      <label class="credential-field">复用已有凭据（可选）
+        <select id="credential-source"><option value="">手动输入账号密码</option></select>
+      </label>
       <label class="credential-field">账号
         <input id="credential-username" name="username" required maxlength="256" autocomplete="off" spellcheck="false">
       </label>
@@ -107,6 +112,7 @@
       </fieldset>
       <div id="add-mac-fields" hidden><label class="credential-field">已认证的 MAC<input id="add-mac" placeholder="02:xx:xx:xx:xx:xx" maxlength="17"></label></div>
       <div id="add-credential-fields">
+        <label class="credential-field">复用已有凭据（可选）<select id="add-source"><option value="">手动输入账号密码</option></select></label>
         <label class="credential-field">账号<input id="add-username" required autocomplete="off" spellcheck="false"></label>
         <label class="credential-field">密码<input id="add-password" type="password" required autocomplete="off"></label>
         <label class="password-visibility"><input id="add-visible" type="checkbox">显示密码</label>

@@ -46,6 +46,15 @@ DEV\twan2\tmacwan2\t450000\t140000
 
 
 class DashboardTests(unittest.TestCase):
+    def test_credential_choices_are_explicit_metadata_requests_not_sampling(self):
+        collector=SERVER.RouterCollector('root@router',2.0)
+        response={'ok':True,'choices':[{'username':'fake-user','interface':'wan2','interfaces':['wan2','wan3']}]}
+        with mock.patch.object(collector,'native_rpc',return_value=response) as rpc:
+            ok,result=collector.credentials('choices','',{})
+        self.assertTrue(ok); self.assertEqual(result,response)
+        rpc.assert_called_once_with('credential_choices',{})
+        self.assertNotIn('choices',collector.__dict__)
+
     def test_native_rpc_credentials_stay_on_stdin(self):
         collector=SERVER.RouterCollector('root@router',2.0)
         values={"action":"add-random","username":"fake-user","password":"fake-secret &账"}

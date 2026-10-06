@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / 'tests'))
 from check_secrets import violations
 
 NAME = 'luci-app-hitwh-mwan'
-VERSION = '1.0.0-5'
+VERSION = '1.0.0-6'
 DEPENDS = ('luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, jsonfilter, '
            'ip-full, kmod-macvlan, firewall4, coreutils-stat')
 
@@ -56,6 +56,7 @@ def build(output):
     installed = sum(len(data) for _, data, _ in entries)
     if installed > 512 * 1024: raise ValueError('Payload exceeds the 512 KiB storage budget')
     control = (f'Package: {NAME}\nVersion: {VERSION}\nArchitecture: all\n'
+               'X-OpenWrt-Series: 24.10\n'
                f'Maintainer: HITwh multi-WAN contributors\nSection: luci\nPriority: optional\n'
                f'Depends: {DEPENDS}\nInstalled-Size: {installed}\n'
                'Description: LuCI multi-WAN management with manually triggered Ruijie ePortal authentication\n').encode()

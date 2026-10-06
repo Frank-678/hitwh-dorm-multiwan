@@ -37,6 +37,7 @@ case "$ACTION" in
     credentials-remove) set -- /usr/sbin/hitwh-mwan auth remove "$IFACE" ;;
     configure) set -- /usr/bin/ucode /usr/share/hitwh-mwan/configure.uc ;;
     discover) set -- /usr/sbin/hitwh-mwan portal "$IFACE" ;;
+    upgrade) set -- /usr/sbin/hitwh-mwan upgrade ;;
     *) exit 2 ;;
 esac
 "$@" <&3 >"$DIR/output" 2>&1 &
@@ -44,11 +45,13 @@ CHILD=$!
 echo "$CHILD" >"$DIR/pid"
 exec 3<&-
 MANAGER=$$
+BUDGET=300
+[ "$ACTION" != upgrade ] || BUDGET=420
 (
     SLEEP_PID=""
     trap '[ -z "$SLEEP_PID" ] || kill "$SLEEP_PID" 2>/dev/null || true' EXIT
     trap 'exit 0' TERM INT HUP
-    sleep 300 & SLEEP_PID=$!
+    sleep "$BUDGET" & SLEEP_PID=$!
     wait "$SLEEP_PID" || exit 0
     kill -TERM "$CHILD" 2>/dev/null || true
 ) &
@@ -59,5 +62,5 @@ kill "$TIMER" 2>/dev/null || true
 wait "$TIMER" 2>/dev/null || true
 TIMER=""
 if [ "$ACTION" = configure ] && [ "$CODE" = 0 ]; then /usr/sbin/hitwh-mwan-update >/dev/null 2>&1 || CODE=1; fi
-ucode /usr/share/hitwh-mwan/job-result.uc "$DIR" "$ACTION" "$CODE"
-rm -f "$DIR/output" "$DIR/pid"
+ucode "$DIR/job-result.uc" "$DIR" "$ACTION" "$CODE"
+rm -f "$DIR/output" "$DIR/pid" "$DIR/worker" "$DIR/common.uc" "$DIR/job-result.uc"

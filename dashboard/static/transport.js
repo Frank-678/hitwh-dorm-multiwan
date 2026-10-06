@@ -29,7 +29,7 @@
   async function action(args) {
     const started = await call('start', args);
     if (!started.ok) return started;
-    const deadline = Date.now() + 320000;
+    const deadline = Date.now() + (args.action === 'upgrade' ? 480000 : 320000);
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 700));
       const result = await call('job', {id:started.job});
@@ -48,6 +48,7 @@
       else if (path === '/api/config') result = await action({action:'configure',...data});
       else if (path === '/api/reconnect') result = await action({action:'refresh',...data});
       else if (path === '/api/paths') result = await action(data);
+      else if (path === '/api/credentials' && data.action === 'choices') result = await call('credential_choices');
       else if (path === '/api/credentials') result = data.action === 'get'
         ? await call('credentials', {interface:data.interface})
         : await action({...data,action:data.action === 'save' ? 'credentials-save' : 'credentials-remove'});

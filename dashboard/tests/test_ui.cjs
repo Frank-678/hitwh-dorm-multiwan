@@ -31,11 +31,13 @@ async function openUI(t) {
   t.after(() => page.close());
   await page.addInitScript(() => {
     if (location.pathname !== '/test') return;
-    window.mock = {calls:[], pending:false, nextResult:null, paths:[2,3].map(n => ({
+    window.mock = {calls:[], submitted:[], pending:false, nextResult:null, delayGets:false, pendingReads:[],
+      saved:{wan2:{username:'fake-user',password:'fake-secret',mac:'02:00:00:00:00:02'}},
+      paths:[2,3].map(n => ({
       interface:'wan'+n, device:'macwan'+n, mac:'02:00:00:00:00:0'+n,
       ip:'192.0.2.'+n, state:'inactive', is_main:false, credentials_saved:false
     }))};
-    let clock=100, target;
+    let clock=100, target, action;
     window.addEventListener('message', e => {
       const iframe=document.querySelector('iframe');
       if (e.origin!==location.origin || e.source!==iframe.contentWindow || e.data.type!=='hitwh-ready') return;
@@ -47,13 +49,28 @@ async function openUI(t) {
           result={raw:{timestamp:1700000000+clock,clock,cpu:[clock,0,0,clock*9,0,0,0,0],
             memory_used_percent:18,load:[0.1,0.2,0.3],conntrack:{count:100,max:10000},
             paths:mock.paths.map(p=>({...p,rx_counter:clock*100000,tx_counter:clock*1000}))},settings:{}};
+        } else if (data.method==='credential_choices') {
+          result={ok:true,choices:[{interface:'wan2',username:'fake-user',interfaces:['wan2']}]};
+        } else if (data.method==='credentials') {
+          const saved=mock.saved[data.args.interface];
+          result={ok:true,configured:!!saved,username:saved?.username||'',password:saved?.password||'',mac:saved?.mac||''};
+          if (mock.delayGets && saved) {
+            mock.pendingReads.push(()=>channel.port1.postMessage({id:data.id,result})); return;
+          }
         } else if (data.method==='start') {
+          action=data.args.action;
           mock.calls.push({action:data.args.action,interface:data.args.interface});
+          mock.submitted.push(data.args);
           target=mock.paths.find(p=>p.interface===data.args.interface);
           result={ok:true,job:'FAKE01'};
         } else if (data.method==='job') {
           if (mock.pending) result={ok:true,state:'running'};
-          else {
+          else if (action==='upgrade') result={ok:true,state:'done',upgrade:{code:'no_update',current:'1.0.0-6',latest:'1.0.0-6'}};
+          else if (action==='credentials-save') {
+            const values=mock.submitted.at(-1);
+            mock.saved[values.interface]={username:values.username,password:values.password,mac:target.mac};
+            result={ok:true,state:'done',message:'操作完成'};
+          } else {
             const attempted=target.state==='active'?0:1;
             result=mock.nextResult || {ok:true,state:'done',details:[],attempted,recovered:attempted,remaining:0};
             if (result.ok) target.state='active';
@@ -131,4 +148,52 @@ test('sampling preserves keyboard focus and explains an already online path', as
   await child.waitForFunction(()=>document.querySelector('.path-feedback').dataset.state==='success');
   assert.match(await feedback.textContent(),/已在线，无需认证/);
   assert.deepEqual(await page.evaluate(()=>mock.calls),[{action:'refresh',interface:'wan2'}]);
+});
+
+test('a credential choice fetches only the selected secret and saves to the target without login', async t => {
+  const {page,ui}=await openUI(t);
+  await ui.locator('.credentials-button[data-interface="wan3"]').click();
+  await ui.locator('#credential-source').waitFor({state:'visible'});
+  await ui.locator('#credential-source').selectOption('wan2');
+  const child=page.frames().find(f=>f.url().includes('/luci-static/resources/hitwh-mwan/'));
+  await child.waitForFunction(()=>document.querySelector('#credential-password').value==='fake-secret');
+  assert.equal(await ui.locator('#credential-password').getAttribute('type'),'password');
+  assert.match(await ui.locator('#credential-source option').last().textContent(),/fake-user.*wan2/);
+  assert(!await ui.locator('#credential-source').evaluate(s=>s.innerHTML.includes('fake-secret')));
+  assert.deepEqual(await page.evaluate(()=>mock.calls),[]);
+  await ui.locator('#credentials-save').click();
+  await ui.locator('#credentials-dialog').waitFor({state:'hidden'});
+  assert.deepEqual(await page.evaluate(()=>mock.calls),[{action:'credentials-save',interface:'wan3'}]);
+  assert.equal(await page.evaluate(()=>mock.submitted[0].mac),undefined);
+  assert.equal(await ui.locator('#credential-password').inputValue(),'');
+});
+
+test('random add can reuse credentials and closing the dialog discards a late secret response', async t => {
+  const {page,ui,child}=await openUI(t);
+  await ui.locator('#add-button').click();
+  await ui.locator('#add-source').selectOption('wan2');
+  await child.waitForFunction(()=>document.querySelector('#add-password').value==='fake-secret');
+  assert.equal(await ui.locator('#add-username').inputValue(),'fake-user');
+  assert.equal(await ui.locator('#add-password').getAttribute('type'),'password');
+  assert.deepEqual(await page.evaluate(()=>mock.calls),[]);
+  await ui.locator('#add-dialog [data-close]').first().click();
+  await ui.locator('#add-button').click();
+  await page.evaluate(()=>mock.delayGets=true);
+  await ui.locator('#add-source').selectOption('wan2');
+  await page.waitForFunction(()=>mock.pendingReads.length===1);
+  await ui.locator('#add-dialog [data-close]').first().click();
+  await page.evaluate(()=>mock.pendingReads.splice(0).forEach(resolve=>resolve()));
+  await child.waitForFunction(()=>document.querySelector('#add-source').options.length===1);
+  assert.equal(await ui.locator('#add-username').inputValue(),'');
+  assert.equal(await ui.locator('#add-password').inputValue(),'');
+  assert.equal(await ui.locator('#add-source option').count(),1);
+  assert.equal(await child.evaluate(()=>localStorage.length+sessionStorage.length),0);
+});
+
+test('checking for updates starts only an upgrade job and displays its version result', async t => {
+  const {page,ui,child}=await openUI(t);
+  await ui.locator('#upgrade-button').click();
+  await child.waitForFunction(()=>document.querySelector('#upgrade-status').textContent.includes('没有可安装'));
+  assert.deepEqual(await page.evaluate(()=>mock.calls),[{action:'upgrade',interface:undefined}]);
+  assert.match(await ui.locator('#upgrade-status').textContent(),/1\.0\.0-6/);
 });

@@ -5,6 +5,7 @@
 const snapshot = rpc.declare({ object: 'hitwh.mwan', method: 'snapshot' });
 const settings = rpc.declare({ object: 'hitwh.mwan', method: 'settings' });
 const credentials = rpc.declare({ object: 'hitwh.mwan', method: 'credentials', params: ['interface'] });
+const credentialChoices = rpc.declare({ object: 'hitwh.mwan', method: 'credential_choices' });
 const start = rpc.declare({ object: 'hitwh.mwan', method: 'start', params:
     ['action','interface','mac','username','password','parent_device','lan_device','portal_url','health_url','balance_mode','router_failover'] });
 const job = rpc.declare({ object: 'hitwh.mwan', method: 'job', params: ['id'] });
@@ -24,6 +25,7 @@ return view.extend({
                     if (data.method === 'snapshot') result = await snapshot();
                     else if (data.method === 'settings') result = await settings();
                     else if (data.method === 'credentials') result = await credentials(a.interface);
+                    else if (data.method === 'credential_choices') result = await credentialChoices();
                     else if (data.method === 'job') result = await job(a.id);
                     else if (data.method === 'start') result = await start(a.action, a.interface || '', a.mac || '',
                         a.username || '', a.password || '', a.parent_device || '', a.lan_device || '', a.portal_url || '', a.health_url || '', a.balance_mode || '', a.router_failover || '');

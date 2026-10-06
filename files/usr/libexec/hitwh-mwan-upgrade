@@ -1,0 +1,116 @@
+#!/bin/sh
+# Explicit check/install only. Never reads or submits campus credentials.
+set +x
+set +a
+umask 077
+PACKAGE=luci-app-hitwh-mwan
+REPO=ponder-j/hitwh-dorm-multiwan
+CURRENT=unknown
+LATEST=unknown
+WORK=""
+finish() { printf 'UPGRADE_RESULT %s %s %s\n' "$1" "$CURRENT" "$LATEST"; exit "${2:-1}"; }
+[ "$(id -u)" = 0 ] || finish root_required
+
+# Continue from a private copy so opkg cannot replace the executing script.
+if [ "${HITWH_MWAN_UPGRADE_STAGED:-}" != 1 ]; then
+    WORK="$(mktemp -d /tmp/hitwh-mwan-upgrade.XXXXXX)" || finish storage_failed
+    cp "$0" "$WORK/runner" || { rm -rf "$WORK"; finish storage_failed; }
+    export HITWH_MWAN_UPGRADE_STAGED=1 HITWH_MWAN_UPGRADE_WORK="$WORK"
+    exec sh "$WORK/runner"
+fi
+WORK="${HITWH_MWAN_UPGRADE_WORK:-}"
+case "$WORK" in /tmp/hitwh-mwan-upgrade.*) ;; *) finish storage_failed ;; esac
+ID="${WORK#/tmp/hitwh-mwan-upgrade.}"
+[ "${#ID}" -eq 6 ] || finish storage_failed
+case "$ID" in *[!a-zA-Z0-9]*) finish storage_failed ;; esac
+[ ! -L "$WORK" ] && [ -d "$WORK" ] && [ "$(stat -c '%u:%a' "$WORK")" = 0:700 ] || finish storage_failed
+CHILD=""; TIMER=""
+cleanup() {
+    [ -z "$CHILD" ] || kill -TERM "-$CHILD" 2>/dev/null || true
+    [ -z "$TIMER" ] || kill "$TIMER" 2>/dev/null || true
+    [ -z "$CHILD" ] || wait "$CHILD" 2>/dev/null || true
+    [ -z "$TIMER" ] || wait "$TIMER" 2>/dev/null || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'finish interrupted' INT TERM HUP
+for CMD in opkg curl jsonfilter sha256sum tar flock setsid; do
+    command -v "$CMD" >/dev/null 2>&1 || finish component_missing
+done
+LOCK=/var/run/hitwh-mwan-management.lock
+[ ! -L "$LOCK" ] || finish storage_failed
+exec 9>"$LOCK" || finish storage_failed
+flock -n 9 || finish busy
+CURRENT="$(opkg status "$PACKAGE" 2>/dev/null | sed -n 's/^Version: //p')"
+printf '%s' "$CURRENT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' || { CURRENT=unknown; finish package_missing; }
+grep -q '24\.10' /etc/openwrt_release || finish incompatible_firmware
+fetch() {
+    curl -4 --noproxy '*' -fsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 5 --max-time 40 --max-filesize "$3" -o "$2" "$1" 2>/dev/null
+}
+fetch "https://api.github.com/repos/$REPO/releases/latest" "$WORK/release.json" 262144 || finish check_failed
+field() { jsonfilter -i "$WORK/release.json" -e "$1" 2>/dev/null; }
+[ "$(field '@.draft')" = false ] && [ "$(field '@.prerelease')" = false ] || finish invalid_release
+TAG="$(field '@.tag_name')"
+LATEST="${TAG#v}"
+printf '%s' "$LATEST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' || { LATEST=unknown; finish invalid_release; }
+[ "$TAG" = "v$LATEST" ] || finish invalid_release
+# opkg's legacy '>' operator includes equality; '>>' is strictly newer.
+opkg compare-versions "$LATEST" '>>' "$CURRENT" || finish no_update 0
+ASSET="${PACKAGE}_${LATEST}_all.ipk"
+IPK_DIGEST=""; SUMS_DIGEST=""
+N=0
+while [ "$N" -lt 64 ]; do
+    NAME="$(field "@.assets[$N].name")"
+    [ -n "$NAME" ] || break
+    case "$NAME" in
+        "$ASSET") IPK_DIGEST="$(field "@.assets[$N].digest")" ;;
+        SHA256SUMS) SUMS_DIGEST="$(field "@.assets[$N].digest")" ;;
+    esac
+    N=$((N + 1))
+done
+printf '%s\n%s\n' "$IPK_DIGEST" "$SUMS_DIGEST" | grep -qvE '^sha256:[0-9a-f]{64}$' && finish invalid_release
+AVAILABLE="$(df -Pk /overlay | awk 'NR==2 {print $4}')"
+[ "${AVAILABLE:-0}" -ge 4096 ] || finish insufficient_space
+BASE="https://github.com/$REPO/releases/download/$TAG"
+fetch "$BASE/SHA256SUMS" "$WORK/SHA256SUMS" 65536 || finish download_failed
+SUMS_HASH="$(sha256sum "$WORK/SHA256SUMS" | awk '{print $1}')"
+[ "sha256:$SUMS_HASH" = "$SUMS_DIGEST" ] || finish verification_failed
+EXPECTED="$(awk -v name="$ASSET" '$2==name && NF==2 {print $1}' "$WORK/SHA256SUMS")"
+printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$' || finish verification_failed
+[ "sha256:$EXPECTED" = "$IPK_DIGEST" ] || finish verification_failed
+fetch "$BASE/$ASSET" "$WORK/$ASSET" 524288 || finish download_failed
+ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
+[ "$ACTUAL" = "$EXPECTED" ] || finish verification_failed
+CONTROL="$(tar -xzOf "$WORK/$ASSET" ./control.tar.gz 2>/dev/null | tar -xzOf - ./control 2>/dev/null)"
+control_field() { printf '%s\n' "$CONTROL" | sed -n "s/^$1: //p"; }
+[ "$(control_field Package)" = "$PACKAGE" ] && [ "$(control_field Version)" = "$LATEST" ] &&
+    [ "$(control_field Architecture)" = all ] && [ "$(control_field X-OpenWrt-Series)" = 24.10 ] || finish incompatible_package
+run_bounded() {
+    SECONDS_LIMIT="$1"; shift
+    setsid "$@" </dev/null 9>&- & CHILD=$!
+    (
+        SLEEP_PID=""
+        trap '[ -z "$SLEEP_PID" ] || kill "$SLEEP_PID" 2>/dev/null || true' EXIT
+        trap 'exit 0' TERM INT HUP
+        sleep "$SECONDS_LIMIT" & SLEEP_PID=$!
+        wait "$SLEEP_PID" || exit 0
+        kill -TERM "-$CHILD" 2>/dev/null || true
+        sleep 3 & SLEEP_PID=$!
+        wait "$SLEEP_PID" || exit 0
+        kill -KILL "-$CHILD" 2>/dev/null || true
+    ) & TIMER=$!
+    wait "$CHILD"; CODE=$?
+    CHILD=""
+    kill "$TIMER" 2>/dev/null || true
+    wait "$TIMER" 2>/dev/null || true
+    TIMER=""
+    return "$CODE"
+}
+run_bounded 60 opkg --noaction install "$WORK/$ASSET" >"$WORK/preflight" 2>&1 || finish dependency_failed
+HITWH_MWAN_IN_APP_UPGRADE=1 run_bounded 180 opkg install "$WORK/$ASSET" >"$WORK/install" 2>&1 || finish install_failed
+INSTALLED="$(opkg status "$PACKAGE" | sed -n 's/^Version: //p')"
+[ "$INSTALLED" = "$LATEST" ] || finish install_failed
+# Give the private job result time to reach the browser before reloading rpcd.
+setsid /bin/sh -c 'sleep 20; /etc/init.d/rpcd restart >/dev/null 2>&1' </dev/null >/dev/null 2>&1 9>&- &
+finish installed 0

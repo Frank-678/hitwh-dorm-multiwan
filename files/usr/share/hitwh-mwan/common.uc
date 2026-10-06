@@ -78,7 +78,13 @@ export function snapshot() {
         let m = match(line, /^(MemTotal|MemAvailable):\s+(\d+)/);
         if (m) memory[m[1]] = +m[2];
     }
+    let package_version = 'unknown';
+    for (let line in split(fs.readfile('/usr/lib/opkg/info/luci-app-hitwh-mwan.control') || '', '\n')) {
+        let version = match(line, /^Version: ([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)$/);
+        if (version) package_version = version[1];
+    }
     return {
+        package_version,
         raw: { timestamp: time(), clock: +(split(fs.readfile('/proc/uptime') || '0', ' ')[0]), cpu,
             memory_used_percent: memory.MemTotal ? 100 * (memory.MemTotal - memory.MemAvailable) / memory.MemTotal : 0,
             load: map(slice(split(trim(fs.readfile('/proc/loadavg') || '0 0 0'), /\s+/),0,3), x => +x),
@@ -102,6 +108,8 @@ export function summarize(action, code, output) {
         if (match(line, /another WAN management operation/)) result.message = '另一项线路操作正在进行，请稍后重试';
         if (match(line, /no free WAN slot|maximum.*paths.*reached/)) result.message = '线路数量已达到上限';
         if (match(line, /^Error: new WAN firewall/)) result.message = '新线路的防火墙规则未成功加载，已撤销本次新增';
+        let upgrade = match(trim(line), /^UPGRADE_RESULT ([a-z_]+) ([a-z0-9.-]+) ([a-z0-9.-]+)$/);
+        if (upgrade) result.upgrade = { code: upgrade[1], current: upgrade[2], latest: upgrade[3] };
     }
     return result;
 };

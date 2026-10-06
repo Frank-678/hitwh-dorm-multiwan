@@ -2,7 +2,7 @@
 set -eu
 [ -z "${IPKG_INSTROOT:-}" ] || exit 0
 grep -q "24.10" /etc/openwrt_release || { echo 'This package targets OpenWrt 24.10/opkg.' >&2; exit 1; }
-for CMD in flock stat hexdump ucode curl ip nft; do
+for CMD in flock stat hexdump ucode curl ip nft sha256sum tar setsid; do
     command -v "$CMD" >/dev/null || { echo "Missing runtime: $CMD; supply its matching offline IPK first." >&2; exit 1; }
 done
 AVAILABLE="$(df -Pk /overlay | awk 'NR==2 {print $4}')"

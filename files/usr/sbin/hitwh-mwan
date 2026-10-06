@@ -90,6 +90,7 @@ Usage:
   hitwh-mwan list
   hitwh-mwan refresh [wan|wanN]
   hitwh-mwan portal [wan|wanN]
+  hitwh-mwan upgrade
   hitwh-mwan auth set <wan|wanN>
   hitwh-mwan auth status [wan|wanN]
   hitwh-mwan auth remove <wan|wanN>
@@ -790,6 +791,10 @@ cmd_speed() {
 }
 
 case "$1" in
+    upgrade)
+        [ "$#" -eq 1 ] || { usage; exit 1; }
+        exec /usr/libexec/hitwh-mwan-upgrade
+        ;;
 	set-main)
 		[ -n "$2" ] || { usage; exit 1; }
 		acquire_management_lock || exit 1
