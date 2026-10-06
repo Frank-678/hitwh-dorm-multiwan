@@ -419,6 +419,7 @@ function clearReuse(prefix) {
   const select = $("#" + prefix + "-source");
   select.replaceChildren(new Option('手动输入账号密码', ''));
   select.disabled = true;
+  select.title = '';
 }
 
 async function loadCredentialChoices(prefix, current = '') {
@@ -435,8 +436,11 @@ async function loadCredentialChoices(prefix, current = '') {
     }
     $("#" + prefix + "-source").disabled = reuseBusy[prefix] || $("#" + prefix + "-source").options.length <= 1;
   } catch (error) {
-    if (generation === reuseGeneration[prefix] && dialog.open)
-      $("#" + prefix + "-source").options[0].textContent = '暂无法读取已有凭据，可手动输入';
+    if (generation === reuseGeneration[prefix] && dialog.open) {
+      const select = $("#" + prefix + "-source");
+      select.options[0].textContent = `读取失败：${error.message || '路由器连接失败'}（可手动输入）`;
+      select.title = '升级后请重载整个 LuCI 页面；登录会话过期时请重新登录。';
+    }
   }
 }
 

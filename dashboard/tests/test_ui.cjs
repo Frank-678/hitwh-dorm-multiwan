@@ -50,7 +50,7 @@ async function openUI(t) {
             memory_used_percent:18,load:[0.1,0.2,0.3],conntrack:{count:100,max:10000},
             paths:mock.paths.map(p=>({...p,rx_counter:clock*100000,tx_counter:clock*1000}))},settings:{}};
         } else if (data.method==='credential_choices') {
-          result={ok:true,choices:[{interface:'wan2',username:'fake-user',interfaces:['wan2']}]};
+          result=mock.choicesError || {ok:true,choices:[{interface:'wan2',username:'fake-user',interfaces:['wan2']}]};
         } else if (data.method==='credentials') {
           const saved=mock.saved[data.args.interface];
           result={ok:true,configured:!!saved,username:saved?.username||'',password:saved?.password||'',mac:saved?.mac||''};
@@ -209,4 +209,15 @@ test('a management reload stops failed polling and asks the user to check the in
     assert.equal(await ui.locator('#upgrade-button').isDisabled(),false);
   }
   assert.deepEqual(await page.evaluate(()=>mock.calls.map(c=>c.action)),['upgrade','upgrade']);
+});
+
+test('a credential list failure explains the cause and keeps manual entry available', async t => {
+  const {page,ui,child}=await openUI(t);
+  await page.evaluate(()=>mock.choicesError={ok:false,message:'登录会话已过期'});
+  await ui.locator('#add-button').click();
+  await child.waitForFunction(()=>document.querySelector('#add-source').options[0].textContent.includes('登录会话已过期'));
+  assert.equal(await ui.locator('#add-source option').count(),1);
+  assert.equal(await ui.locator('#add-username').isEnabled(),true);
+  assert.equal(await ui.locator('#add-password').isEnabled(),true);
+  assert.deepEqual(await page.evaluate(()=>mock.calls),[]);
 });

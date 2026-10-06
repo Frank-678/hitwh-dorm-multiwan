@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / 'tests'))
 from check_secrets import violations
 
 NAME = 'luci-app-hitwh-mwan'
-VERSION = '1.0.0-7'
+VERSION = '1.0.0-8'
 DEPENDS = ('luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, jsonfilter, '
            'ip-full, kmod-macvlan, firewall4, coreutils-stat')
 

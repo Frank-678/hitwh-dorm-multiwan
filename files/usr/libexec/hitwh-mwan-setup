@@ -49,6 +49,13 @@ if ! /etc/init.d/firewall reload; then
 fi
 /usr/sbin/hitwh-mwan-update
 /etc/init.d/hitwh-mwan start
+# IPK archive timestamps are normalized for reproducible builds. Give installed
+# web assets a fresh Last-Modified value so upgrades invalidate browser caches.
+touch /www/luci-static/resources/view/network/hitwh-mwan.js \
+    /www/luci-static/resources/hitwh-mwan/index.html \
+    /www/luci-static/resources/hitwh-mwan/app.js \
+    /www/luci-static/resources/hitwh-mwan/transport.js \
+    /www/luci-static/resources/hitwh-mwan/styles.css
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 rm -rf /tmp/luci-modulecache
 [ "${HITWH_MWAN_IN_APP_UPGRADE:-}" = 1 ] || /etc/init.d/rpcd restart

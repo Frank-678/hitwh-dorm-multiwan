@@ -34,7 +34,7 @@ IPK 的架构为 `all`，因为包内只有脚本和页面资源；底层依赖�
 
 路由器已经安装 OpenWrt，并连接宿舍网线。电脑连接路由器 LAN/Wi-Fi，即使校园网尚未认证，也能通过局域网 SSH 和 LuCI 安装配置。
 
-在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-7) 下载成品 `luci-app-hitwh-mwan_1.0.0-7_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
+在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-8) 下载成品 `luci-app-hitwh-mwan_1.0.0-8_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
 
 ```sh
 python3 tools/build_ipk.py
@@ -44,13 +44,13 @@ python3 tools/build_ipk.py
 构建产物在 `dist/`。将 IPK 传到路由器的 `/tmp`，然后离线安装：
 
 ```sh
-scp -O dist/luci-app-hitwh-mwan_1.0.0-7_all.ipk root@192.168.100.1:/tmp/
-ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-7_all.ipk"
+scp -O dist/luci-app-hitwh-mwan_1.0.0-8_all.ipk root@192.168.100.1:/tmp/
+ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-8_all.ipk"
 ```
 
 下载的成品 IPK 可替换命令中的 `dist/...` 路径。示例使用本机 LAN 地址 `192.168.100.1`；其他路由器请替换为其 LAN 地址。`scp -O` 使用 OpenWrt Dropbear 常见的 SCP 传输方式。
 
-传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-7_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
+传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-8_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
 
 安装依赖：`luci-base`、`rpcd-mod-ucode`、`ucode`、`ucode-mod-fs`、`ucode-mod-uci`、`curl`、`jsonfilter`、`ip-full`、`kmod-macvlan`、`firewall4`、`coreutils-stat`，以及提供 `flock`、`hexdump`、`setsid`、`sha256sum`、`tar` 的 BusyBox。本机固件已具备这些依赖，安装前会检查必需命令。
 
@@ -169,6 +169,8 @@ IPK 只包含必要脚本和页面，打包器限制文件内容总量不超过 
 更新使用 HTTPS 和正常证书校验，不需要 GitHub 令牌，也不上传校园网凭据。下载与执行副本放在 root 私有的 RAM 临时目录，完成后清理；真实校验或依赖失败不会强制安装。更新时需要路由器能够访问 GitHub，且至少有 4 MiB 剩余 overlay。安装期间避免断电。
 
 安装任务独立于管理服务运行，正常更新保留网络身份和凭据。成功后按页面提示刷新；rpcd 会在结果写入后重载，可能需要重新登录 LuCI。跨版本兼容以包内的 OpenWrt 系列标记为准，当前支持 `24.10`。GitHub 最新 Release 的含义见 [官方 API 文档](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)。
+
+安装时更新页面文件的修改时间，避免可复现 IPK 的固定时间戳导致浏览器继续使用旧脚本。从早期版本升级后，首次请重载整个 LuCI 页面并按 Ctrl+F5；凭据列表读取失败会显示具体原因，会话过期时重新登录即可。
 
 首次离线安装及无法访问 GitHub 时，仍可 SCP 新 IPK 后执行 `opkg install /tmp/新版本.ipk`。现有配置和本地凭据保留，升级本身不触发认证。
 
