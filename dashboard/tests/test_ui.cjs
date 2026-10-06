@@ -50,12 +50,17 @@ async function openUI(t) {
             memory_used_percent:18,load:[0.1,0.2,0.3],conntrack:{count:100,max:10000},
             paths:mock.paths.map(p=>({...p,rx_counter:clock*100000,tx_counter:clock*1000}))},settings:{}};
         } else if (data.method==='credential_choices') {
-          result=mock.choicesError || {ok:true,choices:[{interface:'wan2',username:'fake-user',interfaces:['wan2']}]};
+          // Model a cached bridge which rejects the newly introduced method.
+          result={ok:false,message:'无效请求'};
         } else if (data.method==='credentials') {
-          const saved=mock.saved[data.args.interface];
-          result={ok:true,configured:!!saved,username:saved?.username||'',password:saved?.password||'',mac:saved?.mac||''};
-          if (mock.delayGets && saved) {
-            mock.pendingReads.push(()=>channel.port1.postMessage({id:data.id,result})); return;
+          if (data.args.interface==='@choices') {
+            result=mock.choicesError || {ok:true,choices:[{interface:'wan2',username:'fake-user',interfaces:['wan2']}]};
+          } else {
+            const saved=mock.saved[data.args.interface];
+            result={ok:true,configured:!!saved,username:saved?.username||'',password:saved?.password||'',mac:saved?.mac||''};
+            if (mock.delayGets && saved) {
+              mock.pendingReads.push(()=>channel.port1.postMessage({id:data.id,result})); return;
+            }
           }
         } else if (data.method==='start') {
           action=data.args.action;

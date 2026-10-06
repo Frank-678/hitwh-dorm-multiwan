@@ -50,7 +50,8 @@
       else if (path === '/api/config') result = await action({action:'configure',...data});
       else if (path === '/api/reconnect') result = await action({action:'refresh',...data});
       else if (path === '/api/paths') result = await action(data);
-      else if (path === '/api/credentials' && data.action === 'choices') result = await call('credential_choices');
+      // Older cached LuCI bridges already support this privileged method.
+      else if (path === '/api/credentials' && data.action === 'choices') result = await call('credentials', {interface:'@choices'});
       else if (path === '/api/credentials') result = data.action === 'get'
         ? await call('credentials', {interface:data.interface})
         : await action({...data,action:data.action === 'save' ? 'credentials-save' : 'credentials-remove'});

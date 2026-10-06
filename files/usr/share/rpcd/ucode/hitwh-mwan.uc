@@ -78,6 +78,9 @@ return { 'hitwh.mwan': {
     credential_choices: { call: credential_choices },
     credentials: { args: { interface: '' }, call: function(request) {
         let iface = request.args.interface;
+        // '@' cannot occur in an interface name. Keep list reads compatible with
+        // cached LuCI bridges while using the existing credential write ACL.
+        if (iface == '@choices') return credential_choices();
         if (!valid_interface(iface)) return { ok: false, message: '无效线路' };
         let r = run(['/usr/sbin/hitwh-mwan', 'auth', 'get', iface]);
         if (r.code) return { ok: false, message: '无法读取凭据，请检查线路及文件权限' };
