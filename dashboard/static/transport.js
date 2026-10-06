@@ -33,7 +33,9 @@
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 700));
       const result = await call('job', {id:started.job});
-      if (result.state === 'done') return result;
+      if (result?.state === 'done') return result;
+      if (result?.ok === false) return result;
+      if (result?.state !== 'running') return {ok:false,message:'无法读取操作状态，请重新登录后检查已安装版本或线路状态'};
     }
     return {ok:false,message:'操作超时，请检查线路状态'};
   }

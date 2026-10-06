@@ -34,7 +34,7 @@ IPK 的架构为 `all`，因为包内只有脚本和页面资源；底层依赖�
 
 路由器已经安装 OpenWrt，并连接宿舍网线。电脑连接路由器 LAN/Wi-Fi，即使校园网尚未认证，也能通过局域网 SSH 和 LuCI 安装配置。
 
-在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-6) 下载成品 `luci-app-hitwh-mwan_1.0.0-6_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
+在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-7) 下载成品 `luci-app-hitwh-mwan_1.0.0-7_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
 
 ```sh
 python3 tools/build_ipk.py
@@ -44,13 +44,13 @@ python3 tools/build_ipk.py
 构建产物在 `dist/`。将 IPK 传到路由器的 `/tmp`，然后离线安装：
 
 ```sh
-scp -O dist/luci-app-hitwh-mwan_1.0.0-6_all.ipk root@192.168.100.1:/tmp/
-ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-6_all.ipk"
+scp -O dist/luci-app-hitwh-mwan_1.0.0-7_all.ipk root@192.168.100.1:/tmp/
+ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-7_all.ipk"
 ```
 
 下载的成品 IPK 可替换命令中的 `dist/...` 路径。示例使用本机 LAN 地址 `192.168.100.1`；其他路由器请替换为其 LAN 地址。`scp -O` 使用 OpenWrt Dropbear 常见的 SCP 传输方式。
 
-传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-6_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
+传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-7_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
 
 安装依赖：`luci-base`、`rpcd-mod-ucode`、`ucode`、`ucode-mod-fs`、`ucode-mod-uci`、`curl`、`jsonfilter`、`ip-full`、`kmod-macvlan`、`firewall4`、`coreutils-stat`，以及提供 `flock`、`hexdump`、`setsid`、`sha256sum`、`tar` 的 BusyBox。本机固件已具备这些依赖，安装前会检查必需命令。
 

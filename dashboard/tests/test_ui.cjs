@@ -64,7 +64,8 @@ async function openUI(t) {
           target=mock.paths.find(p=>p.interface===data.args.interface);
           result={ok:true,job:'FAKE01'};
         } else if (data.method==='job') {
-          if (mock.pending) result={ok:true,state:'running'};
+          if (mock.pollError) result=mock.pollError;
+          else if (mock.pending) result={ok:true,state:'running'};
           else if (action==='upgrade') result={ok:true,state:'done',upgrade:{code:'no_update',current:'1.0.0-6',latest:'1.0.0-6'}};
           else if (action==='credentials-save') {
             const values=mock.submitted.at(-1);
@@ -196,4 +197,16 @@ test('checking for updates starts only an upgrade job and displays its version r
   await child.waitForFunction(()=>document.querySelector('#upgrade-status').textContent.includes('没有可安装'));
   assert.deepEqual(await page.evaluate(()=>mock.calls),[{action:'upgrade',interface:undefined}]);
   assert.match(await ui.locator('#upgrade-status').textContent(),/1\.0\.0-6/);
+});
+
+test('a management reload stops failed polling and asks the user to check the installed version', async t => {
+  const {page,ui,child}=await openUI(t);
+  for (const error of [{ok:false,message:'路由器请求失败，请检查登录状态和组件'},{}]) {
+    await page.evaluate(error=>mock.pollError=error,error);
+    await ui.locator('#upgrade-button').click();
+    await child.waitForFunction(()=>document.querySelector('#upgrade-status').dataset.state==='error');
+    assert.match(await ui.locator('#upgrade-status').textContent(),/重新登录后检查已安装版本/);
+    assert.equal(await ui.locator('#upgrade-button').isDisabled(),false);
+  }
+  assert.deepEqual(await page.evaluate(()=>mock.calls.map(c=>c.action)),['upgrade','upgrade']);
 });
