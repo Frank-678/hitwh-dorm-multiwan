@@ -6,6 +6,8 @@ const state = {
   previousRaw: null,
   history: [],
   totals: {},
+  refreshTarget: null,
+  pathFeedback: {},
 };
 
 const colors = ["#2563eb", "#0f766e", "#7c3aed", "#c2410c", "#0369a1", "#a21caf", "#4d7c0f"];
@@ -163,41 +165,84 @@ function render(payload) {
 function renderPaths(paths, totalRx) {
   const list = $("#path-list");
   if (!paths.length) {
+    state.pathFeedback = {};
     list.innerHTML = '<div class="empty-paths"><strong>还没有配置线路</strong><p>点击“新增线路”，使用校园网账号认证一个随机 MAC，或添加已认证的 MAC。</p></div>';
     return;
   }
 
-  list.innerHTML = paths.map((path, index) => {
+  const rows = new Map([...list.querySelectorAll('.path-row')].map(row => [row.dataset.interface, row]));
+  if (list.querySelector('.empty-paths')) list.replaceChildren();
+  paths.forEach((path, index) => {
     const share = totalRx > 0 ? Math.min(100, path.rx_bytes_per_second / totalRx * 100) : 0;
     const color = colors[index % colors.length];
     const stateClass = path.state === "active" ? "active" : "inactive";
     const stateText = path.state === "active" ? "在线" : path.state === "inactive" ? "离线" : path.state;
-    return `
-      <article class="path-row">
+    let row = rows.get(path.interface);
+    if (!row) {
+      row = document.createElement('article');
+      row.className = 'path-row';
+      row.dataset.interface = path.interface;
+      row.innerHTML = `
         <div class="path-main">
-          <span class="path-state ${stateClass}" aria-label="${escapeHtml(stateText)}"></span>
+          <span class="path-state"></span>
           <div>
-            <div class="path-name">${escapeHtml(path.interface)} · ${escapeHtml(stateText)}</div>
-            <div class="path-address">${escapeHtml(path.ip)} · ${escapeHtml(path.mac)}</div>
+            <div class="path-name"></div>
+            <div class="path-address"></div>
           </div>
         </div>
         <div>
-          <div class="share-track"><div class="share-fill" style="width:${share.toFixed(1)}%;background:${color}"></div></div>
-          <div class="share-text">当前下载占比 ${share.toFixed(1)}%</div>
+          <div class="share-track"><div class="share-fill"></div></div>
+          <div class="share-text"></div>
         </div>
         <div class="path-numbers">
-          <div class="path-number"><span>下载</span><strong>${formatRate(path.rx_bytes_per_second)}</strong></div>
-          <div class="path-number"><span>上传</span><strong>${formatRate(path.tx_bytes_per_second)}</strong></div>
-          <div class="path-number"><span>本次累计</span><strong>${formatBytes(path.rx_bytes_since_view)}</strong></div>
+          <div class="path-number"><span>下载</span><strong class="path-download"></strong></div>
+          <div class="path-number"><span>上传</span><strong class="path-upload"></strong></div>
+          <div class="path-number"><span>本次累计</span><strong class="path-total"></strong></div>
         </div>
         <div class="path-actions">
-          <button class="credentials-button" type="button" data-interface="${escapeHtml(path.interface)}" ${state.busy ? 'disabled' : ''}>${path.credentials_saved ? "查看凭据" : "添加凭据"}</button>
-          <button class="path-refresh" type="button" data-interface="${escapeHtml(path.interface)}" ${state.busy ? 'disabled' : ''}>刷新</button>
-          <button class="path-edit" type="button" data-interface="${escapeHtml(path.interface)}" ${state.busy ? 'disabled' : ''}>修改 MAC</button>
-          <button class="path-remove" type="button" data-interface="${escapeHtml(path.interface)}" ${state.busy ? 'disabled' : ''}>删除线路</button>
+          <button class="credentials-button" type="button"></button>
+          <button class="path-refresh" type="button">刷新</button>
+          <button class="path-edit" type="button">修改 MAC</button>
+          <button class="path-remove" type="button">删除线路</button>
         </div>
-      </article>`;
-  }).join("");
+        <div class="path-feedback" role="status" aria-live="polite" hidden></div>`;
+      for (const button of row.querySelectorAll('.path-actions button')) button.dataset.interface = path.interface;
+    }
+    rows.delete(path.interface);
+    row.querySelector('.path-state').className = `path-state ${stateClass}`;
+    row.querySelector('.path-state').setAttribute('aria-label', stateText);
+    row.querySelector('.path-name').textContent = `${path.interface} · ${stateText}`;
+    row.querySelector('.path-address').textContent = `${path.ip} · ${path.mac}`;
+    row.querySelector('.share-fill').style.width = `${share.toFixed(1)}%`;
+    row.querySelector('.share-fill').style.background = color;
+    row.querySelector('.share-text').textContent = `当前下载占比 ${share.toFixed(1)}%`;
+    row.querySelector('.path-download').textContent = formatRate(path.rx_bytes_per_second);
+    row.querySelector('.path-upload').textContent = formatRate(path.tx_bytes_per_second);
+    row.querySelector('.path-total').textContent = formatBytes(path.rx_bytes_since_view);
+    row.querySelector('.credentials-button').textContent = path.credentials_saved ? '查看凭据' : '添加凭据';
+    row.querySelector('.path-refresh').textContent = state.refreshTarget === path.interface ? '刷新中…' : '刷新';
+    for (const button of row.querySelectorAll('.path-actions button')) button.disabled = state.busy;
+    const saved = state.pathFeedback[path.interface];
+    const feedback = saved?.mac === path.mac ? saved : null;
+    const note = row.querySelector('.path-feedback');
+    note.hidden = !feedback;
+    note.textContent = feedback?.message || '';
+    note.dataset.state = feedback?.type || '';
+    // Keep existing buttons connected during normal polling so pointer and
+    // keyboard events can finish even when a sample arrives mid-interaction.
+    if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+  });
+  for (const row of rows.values()) {
+    delete state.pathFeedback[row.dataset.interface];
+    row.remove();
+  }
+}
+
+function pathFeedback(interfaceName, message, type) {
+  const path = state.payload?.sample?.paths.find(item => item.interface === interfaceName);
+  if (!path) return;
+  state.pathFeedback[interfaceName] = {mac:path.mac,message,type};
+  renderPaths(state.payload.sample.paths, state.payload.sample.total.rx_bytes_per_second);
 }
 
 function drawChart(history) {
@@ -297,13 +342,16 @@ async function poll() {
 }
 
 async function reconnectPaths(interfaceName = "") {
+  if (state.busy) return;
   const button = $("#reconnect-button");
   const status = $("#refresh-status");
   button.disabled = true;
   operationBusy(true);
-  button.textContent = "刷新中…";
+  state.refreshTarget = interfaceName;
+  if (!interfaceName) button.textContent = "刷新中…";
   status.dataset.state = "";
-  status.textContent = "正在检查线路、恢复 DHCP 并认证离线出口";
+  status.textContent = interfaceName ? `正在刷新 ${interfaceName}：检查线路并认证离线出口` : "正在检查线路、恢复 DHCP 并认证离线出口";
+  if (interfaceName) pathFeedback(interfaceName, '正在检查线路并认证离线出口…', 'pending');
   try {
     const response = await MwanAPI.request("/api/reconnect", {
       method: "POST",
@@ -313,15 +361,19 @@ async function reconnectPaths(interfaceName = "") {
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(resultMessage(result));
     status.dataset.state = "success";
-    status.textContent = resultMessage(result);
+    status.textContent = `${interfaceName ? interfaceName + '：' : ''}${resultMessage(result)}`;
+    if (interfaceName) pathFeedback(interfaceName, resultMessage(result), 'success');
     if (!state.paused) await poll();
   } catch (error) {
     status.dataset.state = "error";
     status.textContent = `刷新失败：${error instanceof Error ? error.message : String(error)}`;
+    if (interfaceName) pathFeedback(interfaceName, status.textContent, 'error');
   } finally {
     button.disabled = false;
     button.textContent = "刷新离线线路";
+    state.refreshTarget = null;
     operationBusy(false);
+    if (state.payload?.sample) renderPaths(state.payload.sample.paths, state.payload.sample.total.rx_bytes_per_second);
   }
 }
 

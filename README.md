@@ -34,7 +34,7 @@ IPK 的架构为 `all`，因为包内只有脚本和页面资源；底层依赖�
 
 路由器已经安装 OpenWrt，并连接宿舍网线。电脑连接路由器 LAN/Wi-Fi，即使校园网尚未认证，也能通过局域网 SSH 和 LuCI 安装配置。
 
-在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-4) 下载成品 `luci-app-hitwh-mwan_1.0.0-4_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
+在**有互联网的电脑**从 [GitHub Release](https://github.com/ponder-j/hitwh-dorm-multiwan/releases/tag/v1.0.0-5) 下载成品 `luci-app-hitwh-mwan_1.0.0-5_all.ipk` 和 `SHA256SUMS`。也可以在电脑克隆本仓库后构建，Python 只用于电脑打包，无第三方包依赖：
 
 ```sh
 python3 tools/build_ipk.py
@@ -44,13 +44,13 @@ python3 tools/build_ipk.py
 构建产物在 `dist/`。将 IPK 传到路由器的 `/tmp`，然后离线安装：
 
 ```sh
-scp -O dist/luci-app-hitwh-mwan_1.0.0-4_all.ipk root@192.168.100.1:/tmp/
-ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-4_all.ipk"
+scp -O dist/luci-app-hitwh-mwan_1.0.0-5_all.ipk root@192.168.100.1:/tmp/
+ssh root@192.168.100.1 "opkg install /tmp/luci-app-hitwh-mwan_1.0.0-5_all.ipk"
 ```
 
 下载的成品 IPK 可替换命令中的 `dist/...` 路径。示例使用本机 LAN 地址 `192.168.100.1`；其他路由器请替换为其 LAN 地址。`scp -O` 使用 OpenWrt Dropbear 常见的 SCP 传输方式。
 
-传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-4_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
+传输前在 IPK 和 `SHA256SUMS` 所在目录执行 `sha256sum -c SHA256SUMS`。Windows PowerShell 可用 `Get-FileHash .\luci-app-hitwh-mwan_1.0.0-5_all.ipk -Algorithm SHA256`，与校验文件中的摘要比较。
 
 安装依赖：`luci-base`、`rpcd-mod-ucode`、`ucode`、`ucode-mod-fs`、`ucode-mod-uci`、`curl`、`jsonfilter`、`ip-full`、`kmod-macvlan`、`firewall4`、`coreutils-stat`，以及提供 `flock`、`hexdump` 的 BusyBox。本机固件已具备这些依赖。
 
@@ -107,6 +107,8 @@ HITwh 可使用默认设置。其他学校点击“接入设置”：
 | 修改 MAC | 改变该线路身份；旧凭据绑定失效，需重新保存确认 |
 | 删除线路 | 删除线路配置和凭据；保留 MAC 历史以避免复用 |
 | 刷新离线线路 | 只处理本轮离线的受管线路；在线线路不登录、不重启 |
+
+单条刷新时，该线路按钮显示“刷新中”，结果保留在线路旁，包括未配置凭据、认证失败或“已在线，无需认证”。采样更新保留按钮节点，不打断鼠标点击或键盘焦点。
 
 删除旧配置中的物理主线路时，它退出线路池且凭据被删除，物理设备保留作其他 macvlan 的底层接口。
 
@@ -175,6 +177,8 @@ make ipk
 ```
 
 Windows 可分别运行 Python 测试及 `python tools/build_ipk.py`；POSIX 权限、信号和锁测试在 Linux/WSL 中验证。`dashboard/server.py` 保留为可选的电脑端 SSH 调试入口，发布 IPK 不包含它。
+
+浏览器交互回归见 `dashboard/tests/test_ui.cjs`，CI 使用 Node.js 24、Playwright 1.62.1 和 Chromium 执行 `node --test dashboard/tests/test_ui.cjs`。这些仅为开发测试依赖，IPK 不包含它们。
 
 构建与 CI 检查私有凭据文件和常见秘密字面量，CI 同时扫描可达 Git 历史和 IPK 内的脚本及页面；测试仅使用虚构凭据。发布前可执行 `python3 tests/check_secrets.py --history --ipk dist/*.ipk`。提交前检查可用 `git config core.hooksPath .githooks` 启用；macOS/Linux 需给钩子执行权限。
 

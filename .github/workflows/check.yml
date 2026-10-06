@@ -8,6 +8,22 @@ permissions:
   contents: read
 
 jobs:
+  browser:
+    name: Dashboard browser interactions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install browser test runtime outside the checkout
+        run: npm install --prefix "$RUNNER_TEMP/hitwh-ui" --no-save --no-package-lock playwright@1.62.1
+      - name: Install Chromium
+        run: |
+          "$RUNNER_TEMP/hitwh-ui/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Test clicks, focus, target scope and feedback during polling
+        run: NODE_PATH="$RUNNER_TEMP/hitwh-ui/node_modules" node --test dashboard/tests/test_ui.cjs
+
   shell:
     runs-on: ubuntu-latest
     steps:
